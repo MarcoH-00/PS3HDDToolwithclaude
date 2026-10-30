@@ -47,26 +47,28 @@ jobs:
       - name: Build writer harness
         run: dotnet build PS3HddTool.WriterHarness -c Release
 
-      # A big-endian UFS2 image with PS3-like geometry (16 KiB blocks, 4 KiB fragments).
-      # Few inodes per cylinder group, so the harness can exhaust one (upstream issue #7).
+      # A big-endian FFSv2 (UFS2) image with PS3-like geometry: superblock at 64 KiB,
+      # 16 KiB blocks, 4 KiB fragments. 2 GiB (sparse) gives several cylinder groups,
+      # and -i keeps inodes per group low so the harness can exhaust one (issue #7).
+      # sshfs shares the workspace live, so the sparse images are never copied.
       - name: Create image in NetBSD
         id: vm
         uses: vmactions/netbsd-vm@v1
         with:
           usesh: true
+          sync: sshfs
           run: |
             set -e
-            mkdir -p work/seed
-            echo "seed" > work/seed/readme.txt
-            makefs -t ffs -B be -s 256m -o version=2,bsize=16384,fsize=4096,density=1048576 work/base.img work/seed
-            echo "== dumpfs"
-            echo "::warning title=dumpfs::$(dumpfs -s work/base.img 2>&1 | head -30 | tr '\n' '|')"
+            mkdir -p work
+            dd if=/dev/zero of=work/base.img bs=1m count=0 seek=2048
+            newfs -F -s 4194304 -O 2 -B be -b 16384 -f 4096 -i 1048576 work/base.img
+            echo "::warning title=dumpfs::$(dumpfs -s work/base.img 2>&1 | head -24 | tr '\n' '|')"
             echo "== baseline fsck"
             fsck_ffs -n -f work/base.img
 
       - name: Run writer harness against the image
         run: |
-          cp work/base.img work/test.img
+          cp --sparse=always work/base.img work/test.img
           dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- work/test.img work/snapshots
 
       - name: fsck_ffs every snapshot

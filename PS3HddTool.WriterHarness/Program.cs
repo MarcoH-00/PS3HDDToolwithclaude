@@ -288,7 +288,10 @@ internal static class Program
     private static void Snapshot(string dir, string name)
     {
         string dest = Path.Combine(dir, name);
-        File.Copy(_image, dest, overwrite: true);
+        // cp keeps the 2 GiB test image sparse; File.Copy would write every zero.
+        var cp = System.Diagnostics.Process.Start("cp", new[] { "--sparse=always", _image, dest })!;
+        cp.WaitForExit();
+        if (cp.ExitCode != 0) throw new IOException($"cp failed with exit code {cp.ExitCode}");
         Log($"snapshot written: {dest}");
     }
 
