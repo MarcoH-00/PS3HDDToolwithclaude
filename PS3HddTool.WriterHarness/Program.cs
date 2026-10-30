@@ -337,6 +337,44 @@ internal static class Program
             }
         }
 
+        // Cylinder group header summary, computed the way fsck pass 5 builds "newcg".
+        for (int c = 0; c < sb.CylinderGroups && problems.Count < 5; c++)
+        {
+            var cg = reader.ReadCylinderGroup(c);
+            byte[] d = cg.RawData;
+            int Be(int off) => System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(d.AsSpan(off));
+            int ndblk = Be(0x14);
+            int ndir = 0, nifree = 0, nbfree = 0, nffree = 0;
+            var frsum = new int[8];
+            for (int idx = 0; idx < sb.InodesPerGroup; idx++)
+            {
+                bool used = (d[cg.InodesUsedOffset + idx / 8] & (1 << (idx % 8))) != 0;
+                if (!used) { nifree++; continue; }
+                long ino = c * sb.InodesPerGroup + idx;
+                if (ino >= 2 && fs.ReadInode(ino).FileType == Ufs2FileType.Directory) ndir++;
+            }
+            for (int start = 0; start < ndblk; start += fpb)
+            {
+                int frags = Math.Min(fpb, ndblk - start), free = 0, run = 0;
+                for (int f = start; f < start + frags; f++)
+                {
+                    if ((d[cg.FreeBlocksOffset + f / 8] & (1 << (f % 8))) != 0) { free++; run++; }
+                    else { if (run > 0 && run < fpb) frsum[run]++; run = 0; }
+                }
+                if (free == fpb) nbfree++;
+                else { if (run > 0 && run < fpb) frsum[run]++; nffree += free; }
+            }
+            var diffs = new List<string>();
+            if (Be(0x18) != ndir) diffs.Add($"ndir {Be(0x18)}!={ndir}");
+            if (Be(0x1C) != nbfree) diffs.Add($"nbfree {Be(0x1C)}!={nbfree}");
+            if (Be(0x20) != nifree) diffs.Add($"nifree {Be(0x20)}!={nifree}");
+            if (Be(0x24) != nffree) diffs.Add($"nffree {Be(0x24)}!={nffree}");
+            for (int i = 0; i < 8; i++) if (Be(0x34 + i * 4) != (i < fpb ? frsum[i] : 0)) diffs.Add($"frsum[{i}] {Be(0x34 + i * 4)}!={frsum[i]}");
+            if (Be(0x28) >= ndblk || Be(0x2C) >= ndblk || Be(0x30) >= sb.InodesPerGroup) diffs.Add($"rotor out of range ({Be(0x28)},{Be(0x2C)},{Be(0x30)})");
+            if (Be(0x78) > sb.InodesPerGroup) diffs.Add($"initediblk {Be(0x78)} > ipg");
+            if (diffs.Count > 0) problems.Add($"CG {c} header: {string.Join(", ", diffs)}");
+        }
+
         var leaked = new List<long>();
         var freeButOwned = new List<long>();
         for (int c = 0; c < sb.CylinderGroups; c++)
