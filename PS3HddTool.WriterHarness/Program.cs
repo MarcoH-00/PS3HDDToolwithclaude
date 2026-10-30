@@ -29,6 +29,7 @@ internal static class Program
         try
         {
             Phase("superblock probe", ProbeSuperblock);
+            Phase("baseline audit", () => { var p0 = Audit(); if (p0 != null) throw new Exception("fresh image fails the audit: " + p0); });
             Phase("baseline mount", () => WithFs(fs => Log($"ncg={fs.Superblock!.CylinderGroups} ipg={fs.Superblock.InodesPerGroup} bsize={fs.Superblock.BlockSize} fsize={fs.Superblock.FragmentSize}")));
 
             Phase("create directories", () =>
@@ -179,7 +180,16 @@ internal static class Program
     /// <summary>One writer per operation, finished with UpdateSuperblock — the same pattern the GUI uses.</summary>
     private static ImageDiskSource? _openDisk; // set while a Batch runs, so lookups reuse its handle
 
-    private static void Batch(Action<Ufs2Writer> action)
+    private static void Batch(Action<Ufs2Writer> action,
+        [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(action))] string label = "")
+    {
+        BatchCore(action);
+        string? problem = Audit();
+        if (problem != null)
+            throw new Exception($"Bitmap audit failed after `{label.Replace("\n", " ")}`: {problem}");
+    }
+
+    private static void BatchCore(Action<Ufs2Writer> action)
     {
         using var disk = new ImageDiskSource(_image, writable: true);
         _openDisk = disk;
@@ -252,6 +262,101 @@ internal static class Program
             }
         }
         Log($"verified {Expected.Count} paths");
+    });
+
+    // ── independent bitmap audit (same idea as fsck pass 1 + pass 5) ─────────────
+
+    /// <summary>
+    /// Walk every allocated inode, collect the fragments it owns using the FFS size
+    /// rule (not di_blocks), and compare with the free-fragment bitmaps of each
+    /// cylinder group's data area. Returns a description of the first inconsistency.
+    /// </summary>
+    private static string? Audit() => WithFs(fs =>
+    {
+        var sb = fs.Superblock!;
+        byte[] raw = fs.RawSuperblockData!;
+        int dblkno = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(0x14));
+        long csaddr = System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x448));
+        int cssize = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(raw.AsSpan(0x9C));
+        long csFrags = (cssize + sb.FragmentSize - 1) / sb.FragmentSize;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        var reader = new Ufs2Writer(fs, fs.DiskSource, 0, dryRun: true, log: _ => { });
+        var owner = new Dictionary<long, long>();
+        var problems = new List<string>();
+
+        void Own(long frag, int count, long ino, string what)
+        {
+            for (int i = 0; i < count; i++)
+                if (!owner.TryAdd(frag + i, ino) && problems.Count < 5)
+                    problems.Add($"fragment 0x{frag + i:X} owned by inodes {owner[frag + i]} and {ino} ({what})");
+        }
+
+        for (int c = 0; c < sb.CylinderGroups; c++)
+        {
+            var cg = reader.ReadCylinderGroup(c);
+            for (int idx = 0; idx < sb.InodesPerGroup; idx++)
+            {
+                bool used = (cg.RawData[cg.InodesUsedOffset + idx / 8] & (1 << (idx % 8))) != 0;
+                long ino = c * sb.InodesPerGroup + idx;
+                if (!used || ino < 2) continue;
+                var inode = fs.ReadInode(ino);
+                if (inode.Mode == 0) { if (problems.Count < 5) problems.Add($"inode {ino} is marked used but is empty"); continue; }
+                if (inode.Blocks == 0) continue;
+                bool indirect = inode.IndirectBlock != 0 || inode.DoubleIndirectBlock != 0 || inode.TripleIndirectBlock != 0;
+                long counted = 0;
+                for (int i = 0; i < 12; i++)
+                {
+                    long a = inode.DirectBlocks[i];
+                    if (a == 0) continue;
+                    long n = inode.Size >= (long)(i + 1) * sb.BlockSize ? fpb
+                        : Math.Max(1, (inode.Size - (long)i * sb.BlockSize + sb.FragmentSize - 1) / sb.FragmentSize);
+                    if (indirect) n = fpb;
+                    Own(a, (int)n, ino, $"direct {i}");
+                    counted += n;
+                }
+                void Walk(long addr, int level)
+                {
+                    if (addr == 0) return;
+                    Own(addr, fpb, ino, $"indirect L{level}");
+                    counted += fpb;
+                    byte[] blk = fs.DiskSource.ReadBytes(addr * sb.FragmentSize, (int)sb.BlockSize);
+                    for (int p = 0; p < blk.Length / 8; p++)
+                    {
+                        long ptr = System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(blk.AsSpan(p * 8));
+                        if (ptr == 0) continue;
+                        if (level == 1) { Own(ptr, fpb, ino, "data via indirect"); counted += fpb; }
+                        else Walk(ptr, level - 1);
+                    }
+                }
+                Walk(inode.IndirectBlock, 1);
+                Walk(inode.DoubleIndirectBlock, 2);
+                Walk(inode.TripleIndirectBlock, 3);
+                long expectedSectors = counted * sb.FragmentSize / 512;
+                if (expectedSectors != inode.Blocks && problems.Count < 5)
+                    problems.Add($"inode {ino}: di_blocks={inode.Blocks} but it owns {expectedSectors} sectors (size {inode.Size})");
+            }
+        }
+
+        var leaked = new List<long>();
+        var freeButOwned = new List<long>();
+        for (int c = 0; c < sb.CylinderGroups; c++)
+        {
+            var cg = reader.ReadCylinderGroup(c);
+            int ndblk = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(cg.RawData.AsSpan(0x14));
+            long baseFrag = c * sb.FragsPerGroup;
+            for (int f = dblkno; f < ndblk; f++)
+            {
+                long abs = baseFrag + f;
+                if (abs >= csaddr && abs < csaddr + csFrags) continue;
+                bool free = (cg.RawData[cg.FreeBlocksOffset + f / 8] & (1 << (f % 8))) != 0;
+                bool owned = owner.ContainsKey(abs);
+                if (!free && !owned) leaked.Add(abs);
+                if (free && owned) freeButOwned.Add(abs);
+            }
+        }
+        if (leaked.Count > 0) problems.Add($"{leaked.Count} fragment(s) marked used but owned by no inode, e.g. {string.Join(", ", leaked.Take(8).Select(a => $"0x{a:X}"))}");
+        if (freeButOwned.Count > 0) problems.Add($"{freeButOwned.Count} fragment(s) owned by an inode but marked FREE, e.g. {string.Join(", ", freeButOwned.Take(8).Select(a => $"0x{a:X}"))}");
+        return problems.Count == 0 ? null : string.Join("; ", problems);
     });
 
     // ── helpers ─────────────────────────────────────────────────────────────────
