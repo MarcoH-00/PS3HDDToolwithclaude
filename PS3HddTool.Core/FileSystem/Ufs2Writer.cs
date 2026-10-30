@@ -487,7 +487,7 @@ public class Ufs2Writer
         {
             long blockAddr = dir.DirectBlocks[i];
             if (blockAddr == 0) break;
-            int blockCapacity = (i == 0 && allocBytes < sb.BlockSize) ? (int)sb.FragmentSize : (int)sb.BlockSize;
+            int blockCapacity = (int)sb.BlockSize; // reads are bounded by di_size below
             int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
             long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
             byte[] block = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
@@ -2133,13 +2133,9 @@ public class Ufs2Writer
             if (blockAddr == 0) break;
             if (bytesLeft <= 0) break;
 
-            // Block 0 is 1 fragment until reallocated. Blocks 1+ are always full blocks.
-            long allocBytes = parentInode.Blocks * 512;
-            int blockCapacity;
-            if (i == 0 && allocBytes < sb.BlockSize)
-                blockCapacity = (int)sb.FragmentSize;
-            else
-                blockCapacity = (int)sb.BlockSize;
+            // di_size never exceeds what is allocated, so reading up to di_size is safe
+            // whether the last block is a fragment run or a whole block.
+            int blockCapacity = (int)sb.BlockSize;
             int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
             long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
             byte[] dirBlock = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
@@ -2158,233 +2154,163 @@ public class Ufs2Writer
             bytesLeft -= thisBlockSize;
         }
 
-        // All existing DIRBLKSIZ sections are full.
-        // Try growing within existing allocation, or reallocate block 0 from fragment to block.
-        long allocatedBytes = parentInode.Blocks * 512;
-        
-        // Case 1: Block 0 is still a fragment and it's full — reallocate to full block
-        if (allocatedBytes == sb.FragmentSize && dirSize >= sb.FragmentSize)
-        {
-            long blockAddr = parentInode.DirectBlocks[0];
-            _log($"  Reallocating block 0 from fragment to full block (di_size={dirSize})");
-            
-            int blk0Cg = (int)(blockAddr / sb.FragsPerGroup);
-            int blk0LocalFrag = (int)(blockAddr % sb.FragsPerGroup);
-            var blk0CgInfo = ReadCylinderGroup(blk0Cg);
-            
-            // Check if adjacent fragments are free — they might have been allocated to files
-            bool canExpandInPlace = true;
-            for (int f = 1; f < fragsPerBlock; f++)
-            {
-                int adjIdx = blk0LocalFrag + f;
-                int adjByte = blk0CgInfo.FreeBlocksOffset + (adjIdx / 8);
-                int adjBit = adjIdx % 8;
-                bool isFree = (blk0CgInfo.RawData[adjByte] & (1 << adjBit)) != 0;
-                if (!isFree)
-                {
-                    canExpandInPlace = false;
-                    _log($"  Adjacent fragment {f} (local {adjIdx}) is in use — must relocate directory block");
-                    break;
-                }
-            }
-            
-            // Read existing fragment data
-            long oldBlockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-            byte[] fragData = _disk.ReadBytes(oldBlockDiskOffset, (int)sb.FragmentSize);
-            byte[] fullBlock = new byte[(int)sb.BlockSize];
-            Array.Copy(fragData, 0, fullBlock, 0, fragData.Length);
-            
-            long newBlockAddr;
-            if (canExpandInPlace)
-            {
-                // Adjacent fragments are free — expand in place
-                for (int f = 1; f < fragsPerBlock; f++)
-                    MarkFragmentUsed(blk0CgInfo, blk0LocalFrag + f);
-                WriteCylinderGroup(blk0CgInfo);
-                newBlockAddr = blockAddr;
-            }
-            else
-            {
-                // Adjacent fragments occupied — allocate a new block elsewhere and move
-                long relocFrag = FindFreeFragments(blk0CgInfo, fragsPerBlock);
-                int relocCg = blk0Cg;
-                CylinderGroupInfo relocCgInfo = blk0CgInfo;
-                if (relocFrag < 0)
-                {
-                    for (int i = 1; i < sb.CylinderGroups; i++)
-                    {
-                        int tryCg = (blk0Cg + i) % sb.CylinderGroups;
-                        relocCgInfo = ReadCylinderGroup(tryCg);
-                        relocFrag = FindFreeFragments(relocCgInfo, fragsPerBlock);
-                        if (relocFrag >= 0) { relocCg = tryCg; break; }
-                    }
-                    if (relocFrag < 0) throw new IOException("No free blocks for directory reallocation.");
-                }
-                newBlockAddr = (long)relocCg * sb.FragsPerGroup + relocFrag;
-                
-                // Mark new block used
-                MarkFragmentsUsed(relocCgInfo, (int)relocFrag, fragsPerBlock);
-                WriteCylinderGroup(relocCgInfo);
-                
-                // Free old fragment
-                MarkFragmentFree(blk0CgInfo, blk0LocalFrag);
-                WriteCylinderGroup(blk0CgInfo);
-                
-                _log($"  Relocated directory block 0 from frag 0x{blockAddr:X} to 0x{newBlockAddr:X}");
-            }
-            
-            // Initialize ALL new DIRBLKSIZ sections with free-space entries (ino=0, reclen=512)
-            // This prevents reclen=0 infinite loops in directory scanners
-            for (int sec = (int)sb.FragmentSize; sec < fullBlock.Length; sec += 512)
-                BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sec + 4), 512);
-            
-            // Add new entry at first section past the original fragment
-            int sectionOffset = (int)sb.FragmentSize;
-            byte[] reallocNameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-            BinaryPrimitives.WriteUInt32BigEndian(fullBlock.AsSpan(sectionOffset), (uint)newInodeNumber);
-            BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sectionOffset + 4), 512);
-            fullBlock[sectionOffset + 6] = entryType;
-            fullBlock[sectionOffset + 7] = (byte)reallocNameBytes.Length;
-            Array.Copy(reallocNameBytes, 0, fullBlock, sectionOffset + 8, reallocNameBytes.Length);
-            
-            // Write full block to disk
-            long newBlockDiskOffset = _partitionOffset + newBlockAddr * sb.FragmentSize;
-            QueueWrite(newBlockDiskOffset, fullBlock, $"Realloc block 0 to full block + grow (add '{name}')");
-            
-            // Update inode: di_db[0] = new address, di_blocks = BlockSize/512, di_size += 512
-            var reallocRaw = _disk.ReadBytes(
-                _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-                (int)sb.InodeSize);
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x70), newBlockAddr); // di_db[0]
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x18), sb.BlockSize / 512);
-            long reallocOldSize = BinaryPrimitives.ReadInt64BigEndian(reallocRaw.AsSpan(0x10));
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x10), reallocOldSize + 512);
-            WriteInode(parentInodeNumber, reallocRaw);
-            expanded = true;
-            expandedRawParent = reallocRaw;
-            _log($"  Reallocated block 0: di_blocks={sb.BlockSize / 512}, size {reallocOldSize} -> {reallocOldSize + 512}");
-            return;
-        }
-        
-        // Case 2: Grow within existing allocation (block 0 already reallocated, or blocks 1+)
-        if (dirSize < allocatedBytes)
-        {
-            long offset = 0;
-            for (int i = 0; i < 12; i++)
-            {
-                long blockAddr = parentInode.DirectBlocks[i];
-                if (blockAddr == 0) break;
-                
-                // Block 0 might still be a single fragment (allocatedBytes == FragmentSize)
-                // Only after Case 1 realloc does block 0 become a full block.
-                long blockAllocated;
-                if (i == 0 && allocatedBytes <= sb.FragmentSize)
-                    blockAllocated = sb.FragmentSize;
-                else if (i == 0 && allocatedBytes < sb.BlockSize)
-                    blockAllocated = allocatedBytes; // partially grown
-                else
-                    blockAllocated = sb.BlockSize;
-                
-                if (offset + blockAllocated > dirSize)
-                {
-                    long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-                    byte[] fullBlock = _disk.ReadBytes(blockDiskOffset, (int)blockAllocated);
-                    
-                    int sectionOffset = (int)(dirSize - offset);
-                    byte[] growNameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-                    
-                    Array.Clear(fullBlock, sectionOffset, 512);
-                    BinaryPrimitives.WriteUInt32BigEndian(fullBlock.AsSpan(sectionOffset), (uint)newInodeNumber);
-                    BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sectionOffset + 4), 512);
-                    fullBlock[sectionOffset + 6] = entryType;
-                    fullBlock[sectionOffset + 7] = (byte)growNameBytes.Length;
-                    Array.Copy(growNameBytes, 0, fullBlock, sectionOffset + 8, growNameBytes.Length);
-                    
-                    QueueWrite(blockDiskOffset, fullBlock, $"Grow dir within block (add '{name}')");
-                    
-                    var growRawParent = _disk.ReadBytes(
-                        _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                        + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-                        (int)sb.InodeSize);
-                    long growOldSize = BinaryPrimitives.ReadInt64BigEndian(growRawParent.AsSpan(0x10));
-                    BinaryPrimitives.WriteInt64BigEndian(growRawParent.AsSpan(0x10), growOldSize + 512);
-                    WriteInode(parentInodeNumber, growRawParent);
-                    expanded = true;
-                    expandedRawParent = growRawParent;
-                    _log($"  Grew directory within block: size {growOldSize} -> {growOldSize + 512}");
-                    return;
-                }
-                offset += blockAllocated;
-            }
-        }
-
-        // All existing fragments are truly full — expand with a new full block
-        _log($"  All directory blocks full, expanding with new block (dirSize={dirSize})");
-
-        // Find the next free direct block slot
-        int newSlot = -1;
-        for (int i = 0; i < 12; i++)
-        {
-            if (parentInode.DirectBlocks[i] == 0) { newSlot = i; break; }
-        }
-        if (newSlot < 0)
-            throw new IOException("Directory has 12 direct blocks full — indirect directory blocks not supported yet.");
-
-        // Allocate a new data block (use blockCg or scan for free)
-        long newFrag = FindFreeFragments(blockCgInfo, fragsPerBlock);
-        int allocCg = blockCg;
-        if (newFrag < 0)
-        {
-            for (int i = 1; i < sb.CylinderGroups; i++)
-            {
-                int tryCg = (blockCg + i) % sb.CylinderGroups;
-                var tryCgInfo = ReadCylinderGroup(tryCg);
-                newFrag = FindFreeFragments(tryCgInfo, fragsPerBlock);
-                if (newFrag >= 0) { allocCg = tryCg; blockCgInfo = tryCgInfo; break; }
-            }
-            if (newFrag < 0) throw new IOException("No free blocks for directory expansion.");
-        }
-        long newAbsFrag = (long)allocCg * sb.FragsPerGroup + newFrag;
-
-        // Build a new directory block with one entry in a single DIRBLKSIZ (512-byte) section
-        // Initialize all sections with free-space entries to prevent reclen=0 loops
-        byte[] newBlock = new byte[(int)sb.BlockSize];
-        for (int sec = 0; sec < newBlock.Length; sec += 512)
-            BinaryPrimitives.WriteUInt16BigEndian(newBlock.AsSpan(sec + 4), 512);
-        
-        // Overwrite first section with actual entry
-        BinaryPrimitives.WriteUInt32BigEndian(newBlock.AsSpan(0), (uint)newInodeNumber);
-        BinaryPrimitives.WriteUInt16BigEndian(newBlock.AsSpan(4), 512); // reclen = DIRBLKSIZ
-        newBlock[6] = entryType;
-        byte[] nameBytes2 = System.Text.Encoding.UTF8.GetBytes(name);
-        newBlock[7] = (byte)nameBytes2.Length;
-        Array.Copy(nameBytes2, 0, newBlock, 8, nameBytes2.Length);
-
-        WriteDataBlock(newAbsFrag, newBlock);
-        MarkFragmentsUsed(blockCgInfo, (int)newFrag, fragsPerBlock);
-        WriteCylinderGroup(blockCgInfo);
-
-        // Update parent inode: add new block pointer and increase size
-        var rawParent = _disk.ReadBytes(
-            _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-            + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-            (int)sb.InodeSize);
-
-        // Write new direct block pointer at di_db[newSlot] (offset 0x70 + slot*8)
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x70 + newSlot * 8), newAbsFrag);
-        // Update di_size: only add DIRBLKSIZ (512), not the full block
-        // Future entries will grow di_size in 512-byte increments within this block
-        long oldSize = BinaryPrimitives.ReadInt64BigEndian(rawParent.AsSpan(0x10));
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x10), oldSize + 512);
-        // Update di_blocks: full block was allocated
-        long oldBlocks = BinaryPrimitives.ReadInt64BigEndian(rawParent.AsSpan(0x18));
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x18), oldBlocks + sb.BlockSize / 512);
-        WriteInode(parentInodeNumber, rawParent);
+        GrowDirectory(parentInodeNumber, newInodeNumber, name, entryType, blockCg, blockCgInfo, fragsPerBlock,
+            out expandedRawParent);
         expanded = true;
-        expandedRawParent = rawParent;
+    }
 
-        _log($"  Expanded directory: new block at frag 0x{newAbsFrag:X} (slot {newSlot}), size now {oldSize + 512}");
+    /// <summary>
+    /// Append one 512-byte directory chunk (DIRBLKSIZ) holding the new entry, the way
+    /// FFS does it: the last block only owns enough fragments to cover di_size. When the
+    /// chunk does not fit, the last block grows by one fragment (in place if the next
+    /// fragment is free, otherwise the fragments are copied to a new run), and a new
+    /// block starts as a single fragment. Upstream allocated whole blocks while counting
+    /// di_size in 512-byte steps, which fsck reports as INCORRECT BLOCK COUNT and
+    /// BLK(S) MISSING IN BIT MAPS.
+    /// </summary>
+    private void GrowDirectory(long dirInode, long newInodeNumber, string name, byte entryType,
+        int preferredCg, CylinderGroupInfo preferredCgInfo, int fpb, out byte[]? rawDirOut)
+    {
+        var sb = _fs.Superblock!;
+        int fsize = (int)sb.FragmentSize;
+        int bsize = (int)sb.BlockSize;
+        byte[] nameBytes = ValidateEntryName(name);
+
+        byte[] raw = ReadRawInode(dirInode);
+        long size = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x10));
+        long diBlocks = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x18));
+        if (size <= 0 || size % 512 != 0)
+            throw new InvalidDataException($"Directory inode {dirInode} has an unexpected size ({size}).");
+        if (BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0xD0)) != 0)
+            throw new IOException("Directory uses indirect blocks — growing it is not supported yet.");
+
+        int lastIdx = (int)((size - 1) / bsize);
+        long totalFrags = diBlocks * 512 / fsize;
+        int allocLast = (int)Math.Clamp(totalFrags - (long)lastIdx * fpb, 1, fpb);
+        long lastAddr = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x70 + lastIdx * 8));
+
+        long newSize = size + 512;
+        int targetIdx;
+        long targetAddr;
+        int sectionOffset; // byte offset of the new chunk inside the target block
+
+        if (size % bsize == 0)
+        {
+            // Last block is full: start a new block with one fragment.
+            targetIdx = lastIdx + 1;
+            if (targetIdx >= 12)
+                throw new IOException("Directory has 12 direct blocks full — indirect directory blocks not supported yet.");
+            var (cgNum, cgInfo, local) = AllocFragments(preferredCg, preferredCgInfo, 1);
+            targetAddr = (long)cgNum * sb.FragsPerGroup + local;
+            MarkFragmentsUsed(cgInfo, local, 1);
+            WriteCylinderGroup(cgInfo);
+            diBlocks += fsize / 512;
+            sectionOffset = 0;
+            byte[] frag = new byte[fsize];
+            for (int sec = 0; sec < fsize; sec += 512)
+                BinaryPrimitives.WriteUInt16BigEndian(frag.AsSpan(sec + 4), 512);
+            WriteEntryInChunk(frag, 0, newInodeNumber, nameBytes, entryType);
+            QueueWrite(_partitionOffset + targetAddr * fsize, frag, $"New directory block {targetIdx} (add '{name}')");
+            _log($"  Directory grew: new block {targetIdx} at frag 0x{targetAddr:X}");
+        }
+        else
+        {
+            targetIdx = lastIdx;
+            sectionOffset = (int)(size - (long)lastIdx * bsize);
+            int needed = (sectionOffset + 512 + fsize - 1) / fsize;
+            targetAddr = lastAddr;
+
+            if (needed > allocLast)
+            {
+                // Need one more fragment for this block.
+                int cgNum = (int)(lastAddr / sb.FragsPerGroup);
+                int local = (int)(lastAddr % sb.FragsPerGroup);
+                var cgInfo = ReadCylinderGroup(cgNum);
+                int nextLocal = local + allocLast;
+                bool inPlace = needed <= fpb && (nextLocal % fpb) != 0
+                    && IsFragmentFree(cgInfo, nextLocal)
+                    && !_protectedFragments.Contains((long)cgNum * sb.FragsPerGroup + nextLocal);
+                if (inPlace)
+                {
+                    MarkFragmentsUsed(cgInfo, nextLocal, needed - allocLast);
+                    WriteCylinderGroup(cgInfo);
+                    _log($"  Directory block {lastIdx} extended in place to {needed} fragment(s)");
+                }
+                else
+                {
+                    var (newCg, newCgInfo, newLocal) = AllocFragments(cgNum, cgInfo, needed);
+                    long newAddr = (long)newCg * sb.FragsPerGroup + newLocal;
+                    byte[] oldData = _disk.ReadBytes(_partitionOffset + lastAddr * fsize, allocLast * fsize);
+                    byte[] moved = new byte[needed * fsize];
+                    Array.Copy(oldData, moved, oldData.Length);
+                    for (int sec = oldData.Length; sec < moved.Length; sec += 512)
+                        BinaryPrimitives.WriteUInt16BigEndian(moved.AsSpan(sec + 4), 512);
+                    MarkFragmentsUsed(newCgInfo, newLocal, needed);
+                    WriteCylinderGroup(newCgInfo);
+                    QueueWrite(_partitionOffset + newAddr * fsize, moved, $"Relocate directory block {lastIdx} to grow it");
+                    // The old fragments are released after the inode points at the copy.
+                    _pendingDirFree = (lastAddr, allocLast);
+                    targetAddr = newAddr;
+                    BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x70 + lastIdx * 8), newAddr);
+                    _log($"  Directory block {lastIdx} relocated from 0x{lastAddr:X} to 0x{newAddr:X} ({needed} fragments)");
+                }
+                diBlocks += (long)(needed - allocLast) * fsize / 512;
+            }
+
+            // Write the new chunk (a fresh 512-byte section) inside the target block.
+            long chunkOffset = _partitionOffset + targetAddr * fsize + sectionOffset;
+            byte[] chunk = new byte[512];
+            WriteEntryInChunk(chunk, 0, newInodeNumber, nameBytes, entryType);
+            QueueWrite(chunkOffset, chunk, $"Directory chunk at block {targetIdx}+{sectionOffset} (add '{name}')");
+        }
+
+        if (targetIdx != lastIdx)
+            BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x70 + targetIdx * 8), targetAddr);
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x10), newSize);
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x18), diBlocks);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x28), now); // mtime
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x30), now); // ctime
+        if (SafeWriteOrdering) DurabilityBarrier();
+        WriteInode(dirInode, raw);
+
+        if (_pendingDirFree.HasValue)
+        {
+            var (freeAddr, freeCount) = _pendingDirFree.Value;
+            _pendingDirFree = null;
+            FreeFragmentRun(freeAddr, freeCount);
+        }
+        rawDirOut = raw;
+        _log($"  Directory inode {dirInode}: size {size} -> {newSize}, di_blocks {diBlocks}");
+    }
+
+    private (long Addr, int Count)? _pendingDirFree;
+
+    private static void WriteEntryInChunk(byte[] buf, int offset, long inode, byte[] nameBytes, byte entryType)
+    {
+        Array.Clear(buf, offset, 512);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(offset), (uint)inode);
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(offset + 4), 512);
+        buf[offset + 6] = entryType;
+        buf[offset + 7] = (byte)nameBytes.Length;
+        Array.Copy(nameBytes, 0, buf, offset + 8, nameBytes.Length);
+    }
+
+    /// <summary>Find <paramref name="count"/> free fragments inside one block, preferring a CG.</summary>
+    private (int CgNum, CylinderGroupInfo CgInfo, int Local) AllocFragments(int preferredCg, CylinderGroupInfo preferredCgInfo, int count)
+    {
+        var sb = _fs.Superblock!;
+        long local = FindFreeFragments(preferredCgInfo, count);
+        if (local >= 0) return (preferredCg, preferredCgInfo, (int)local);
+        for (int i = 1; i < sb.CylinderGroups; i++)
+        {
+            int tryCg = (preferredCg + i) % sb.CylinderGroups;
+            var info = ReadCylinderGroup(tryCg);
+            if (info.Magic != 0x00090255) continue;
+            local = FindFreeFragments(info, count);
+            if (local >= 0) return (tryCg, info, (int)local);
+        }
+        throw new IOException("No free space left for the directory.");
     }
 
     /// <summary>

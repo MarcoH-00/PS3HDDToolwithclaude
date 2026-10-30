@@ -86,8 +86,10 @@ jobs:
             ssh -q -T netbsd "fsck_ffs -n -f /var/tmp/fsck/$name; echo EXIT=\$?; rm -f /var/tmp/fsck/$name" 2>&1 | tr -d '\r' > fsck.out
             cat fsck.out
             rc=$(sed -n 's/^EXIT=//p' fsck.out | tail -n 1)
-            out=$(grep -v '^EXIT=' fsck.out)
-            if [ "${rc:-1}" != "0" ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
+            # fsck warns that an image file is not a character device and auto-answers
+            # "CONTINUE? yes"; that is expected and not a filesystem problem.
+            out=$(grep -v '^EXIT=' fsck.out | grep -v 'DIOCGDINFO' | grep -v 'is not a character device' | grep -v '^CONTINUE? yes')
+            if echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
               bad=1
             else
               bad=0
