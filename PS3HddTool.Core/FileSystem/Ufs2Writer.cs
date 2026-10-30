@@ -732,174 +732,86 @@ public class Ufs2Writer
             _cgSearchCursor[cg.CgNumber] = runStartFrag + runBlocks * fragsPerBlock;
             return (runStartFrag, runBlocks);
         }
+        // Nothing after the cursor: wrap once so space freed earlier in the group is reused.
+        if (startFrom > _cachedDblkno + fragsPerBlock && _cgSearchCursor.Remove(cg.CgNumber))
+            return FindFreeBlockRun(cg, fragsPerBlock, maxBlocks);
         return (-1, 0);
     }
 
     public long FindFreeFragments(CylinderGroupInfo cg, int count)
     {
+        // FFS rule: a run of fragments must lie inside one block, and a full-block
+        // allocation must be block-aligned. Upstream's linear scan could return a run
+        // that straddled two blocks (found by fsck in CI), which the kernel treats as
+        // two half-owned blocks. Partial blocks are preferred for fragment runs so
+        // whole blocks stay available for large files, as ffs_alloccg does.
         var sb = _fs.Superblock!;
-        int fpg = (int)sb.FragsPerGroup;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        if (count <= 0 || count > fpb)
+            throw new ArgumentOutOfRangeException(nameof(count), $"Fragment runs must be 1..{fpb} fragments.");
+
+        int ndblk = BinaryPrimitives.ReadInt32BigEndian(cg.RawData.AsSpan(0x14));
+        if (ndblk <= 0 || ndblk > sb.FragsPerGroup) ndblk = (int)sb.FragsPerGroup;
+        int nblocks = ndblk / fpb;
+        if (nblocks <= 0) return -1;
         int bitmapOffset = cg.FreeBlocksOffset;
-        int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
+        if (bitmapOffset + (ndblk + 7) / 8 > cg.RawData.Length) return -1;
+        long cgBase = (long)cg.CgNumber * sb.FragsPerGroup;
 
-        if (_cachedDblkno < 0)
-            _cachedDblkno = BinaryPrimitives.ReadInt32BigEndian(_fs.RawSuperblockData.AsSpan(0x14));
+        int startBlock = 0;
+        if (_cgSearchCursor.TryGetValue(cg.CgNumber, out int cursor) && cursor > 0)
+            startBlock = (cursor / fpb) % nblocks;
 
-        // UFS2 rule: full-block allocations (count >= fragsPerBlock) MUST be block-aligned.
-        // Fragment allocations (count < fragsPerBlock, e.g. for directories) can start anywhere.
-        bool requireBlockAlign = (count >= fragsPerBlock);
+        bool Usable(int localFrag)
+            => (cg.RawData[bitmapOffset + (localFrag / 8)] & (1 << (localFrag % 8))) != 0
+               && !_protectedFragments.Contains(cgBase + localFrag);
 
-        // Start from cursor if available
-        int startFrom = _cachedDblkno;
-        if (_cgSearchCursor.TryGetValue(cg.CgNumber, out int cursor) && cursor > startFrom)
-            startFrom = cursor;
-
-        // If block alignment required, round up startFrom to next block boundary
-        if (requireBlockAlign && (startFrom % fragsPerBlock) != 0)
-            startFrom = ((startFrom / fragsPerBlock) + 1) * fragsPerBlock;
-
-        int consecutive = 0;
-        int startFrag = -1;
-
-        for (int f = startFrom; f < fpg; f++)
+        int firstWholeBlock = -1;
+        for (int k = 0; k < nblocks; k++)
         {
-            int byteIdx = bitmapOffset + (f / 8);
-            if (byteIdx >= cg.RawData.Length) break;
+            int b = (startBlock + k) % nblocks;
+            int blockStart = b * fpb;
+            if (cg.RawData[bitmapOffset + (blockStart / 8)] == 0 && fpb <= 8 && (blockStart % 8) + fpb <= 8)
+                continue; // whole bitmap byte used: nothing free in this block
 
-            // Skip fully-used bytes
-            if (consecutive == 0 && (f % 8) == 0 && cg.RawData[byteIdx] == 0x00)
+            int free = 0;
+            for (int j = 0; j < fpb; j++) if (Usable(blockStart + j)) free++;
+            if (free == 0) continue;
+
+            if (free == fpb)
             {
-                f += 7;
-                // After skipping, re-align if needed
-                if (requireBlockAlign && consecutive == 0)
+                if (count == fpb)
                 {
-                    int nextAligned = (((f + 1) / fragsPerBlock) + 1) * fragsPerBlock;
-                    if (nextAligned > f + 1) f = nextAligned - 1; // -1 because loop increments
+                    _cgSearchCursor[cg.CgNumber] = blockStart + fpb;
+                    return blockStart;
                 }
+                if (firstWholeBlock < 0) firstWholeBlock = blockStart;
                 continue;
             }
+            if (count == fpb) continue;
 
-            int bitIdx = f % 8;
-            bool isFree = (cg.RawData[byteIdx] & (1 << bitIdx)) != 0;
-
-            if (isFree)
+            // Partially used block: look for `count` free fragments in a row inside it.
+            int run = 0;
+            for (int j = 0; j < fpb; j++)
             {
-                long globalFrag = (long)cg.CgNumber * sb.FragsPerGroup + f;
-                if (_protectedFragments.Contains(globalFrag))
+                if (Usable(blockStart + j))
                 {
-                    consecutive = 0;
-                    if (requireBlockAlign)
+                    if (++run >= count)
                     {
-                        // Skip to next block boundary
-                        int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                        f = nextAligned - 1;
+                        int found = blockStart + j - count + 1;
+                        _cgSearchCursor[cg.CgNumber] = blockStart;
+                        return found;
                     }
                 }
-                else
-                {
-                    if (consecutive == 0)
-                    {
-                        // For block-aligned allocations, only start on block boundaries
-                        if (requireBlockAlign && (f % fragsPerBlock) != 0)
-                        {
-                            // Skip to next block boundary
-                            int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                            f = nextAligned - 1;
-                            continue;
-                        }
-                        startFrag = f;
-                    }
-                    consecutive++;
-                    if (consecutive >= count)
-                    {
-                        _cgSearchCursor[cg.CgNumber] = startFrag + count;
-                        return startFrag;
-                    }
-                }
-            }
-            else
-            {
-                consecutive = 0;
-                if (requireBlockAlign)
-                {
-                    // Skip to next block boundary
-                    int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                    f = nextAligned - 1;
-                }
+                else run = 0;
             }
         }
 
-        // Wrap around if cursor was past start
-        if (startFrom > _cachedDblkno)
+        if (count < fpb && firstWholeBlock >= 0)
         {
-            consecutive = 0;
-            int wrapStart = _cachedDblkno;
-            if (requireBlockAlign && (wrapStart % fragsPerBlock) != 0)
-                wrapStart = ((wrapStart / fragsPerBlock) + 1) * fragsPerBlock;
-
-            for (int f = wrapStart; f < startFrom; f++)
-            {
-                int byteIdx = bitmapOffset + (f / 8);
-                if (byteIdx >= cg.RawData.Length) break;
-
-                if (consecutive == 0 && (f % 8) == 0 && cg.RawData[byteIdx] == 0x00)
-                {
-                    f += 7;
-                    if (requireBlockAlign && consecutive == 0)
-                    {
-                        int nextAligned = (((f + 1) / fragsPerBlock) + 1) * fragsPerBlock;
-                        if (nextAligned > f + 1) f = nextAligned - 1;
-                    }
-                    continue;
-                }
-
-                int bitIdx = f % 8;
-                bool isFree = (cg.RawData[byteIdx] & (1 << bitIdx)) != 0;
-
-                if (isFree)
-                {
-                    long globalFrag = (long)cg.CgNumber * sb.FragsPerGroup + f;
-                    if (_protectedFragments.Contains(globalFrag))
-                    {
-                        consecutive = 0;
-                        if (requireBlockAlign)
-                        {
-                            int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                            f = nextAligned - 1;
-                        }
-                    }
-                    else
-                    {
-                        if (consecutive == 0)
-                        {
-                            if (requireBlockAlign && (f % fragsPerBlock) != 0)
-                            {
-                                int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                                f = nextAligned - 1;
-                                continue;
-                            }
-                            startFrag = f;
-                        }
-                        consecutive++;
-                        if (consecutive >= count)
-                        {
-                            _cgSearchCursor[cg.CgNumber] = startFrag + count;
-                            return startFrag;
-                        }
-                    }
-                }
-                else
-                {
-                    consecutive = 0;
-                    if (requireBlockAlign)
-                    {
-                        int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                        f = nextAligned - 1;
-                    }
-                }
-            }
+            _cgSearchCursor[cg.CgNumber] = firstWholeBlock;
+            return firstWholeBlock;
         }
-
         return -1;
     }
 
