@@ -21,6 +21,13 @@ public interface IDiskSource : IDisposable
 
     /// <summary>Whether this source supports writing.</summary>
     bool CanWrite { get; }
+
+    /// <summary>
+    /// Force every completed write down to stable storage (fsync / FlushFileBuffers).
+    /// Wrappers forward to the source they wrap. The default does nothing, which is
+    /// correct for purely in-memory sources.
+    /// </summary>
+    void Flush() { }
 }
 
 /// <summary>
@@ -87,6 +94,14 @@ public sealed class ImageDiskSource : IDiskSource
         {
             _stream.Seek(offset, SeekOrigin.Begin);
             _stream.Write(data);
+        }
+    }
+
+    public void Flush()
+    {
+        lock (_lock)
+        {
+            if (_stream.CanWrite) _stream.Flush(flushToDisk: true);
         }
     }
 
@@ -344,6 +359,9 @@ public sealed class PhysicalDiskSource : IDiskSource
                         _writeStream.Write(new ReadOnlySpan<byte>((void*)_alignedWriteBuf, data.Length));
                     }
                 }
+                // The unbuffered handle bypasses _stream's 64 KB read buffer. Drop that
+                // buffer so a later read of this region can never return stale bytes.
+                _stream.Flush();
                 sw.Stop();
                 UnbufferedBytesWritten += data.Length;
                 UnbufferedWriteMs += sw.ElapsedMilliseconds;
@@ -368,6 +386,16 @@ public sealed class PhysicalDiskSource : IDiskSource
             _alignedWriteBuf = (IntPtr)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(
                 (nuint)size, (nuint)Alignment);
             _alignedWriteBufSize = size;
+        }
+    }
+
+    public void Flush()
+    {
+        if (!_writable) return;
+        lock (_lock)
+        {
+            _writeStream?.Flush(flushToDisk: true);
+            _stream.Flush(flushToDisk: true);
         }
     }
 

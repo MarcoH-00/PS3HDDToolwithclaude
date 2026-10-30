@@ -23,6 +23,8 @@ public sealed class NonDisposingDiskSource : IDiskSource
     public void WriteBytes(long offset, byte[] data) => _inner.WriteBytes(offset, data);
     public void WriteBytes(long offset, ReadOnlySpan<byte> data) => _inner.WriteBytes(offset, data);
 
+    public void Flush() => _inner.Flush();
+
     // Intentionally does NOT dispose the inner source
     public void Dispose() { }
 }

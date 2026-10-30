@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build solution
+        run: dotnet build PS3HddTool.sln -c Release
+
+      - name: Build writer harness
+        run: dotnet build PS3HddTool.WriterHarness -c Release
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          dotnet run --project PS3HddTool.Tests -c Release --no-build 2>&1 | tee tests.log || {
+            echo "::error title=Unit tests failed::$(tail -n 30 tests.log | tr '\n' '|' | cut -c1-3500)"
+            exit 1
+          }
+
+  writer-fsck:
+    name: Writer vs. NetBSD fsck_ffs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build writer harness
+        run: dotnet build PS3HddTool.WriterHarness -c Release
+
+      # A big-endian FFSv2 (UFS2) image with PS3-like geometry: superblock at 64 KiB,
+      # 16 KiB blocks, 4 KiB fragments. 2 GiB (sparse) gives several cylinder groups,
+      # and -i keeps inodes per group low so the harness can exhaust one (issue #7).
+      - name: Create image in NetBSD
+        id: vm
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            set -e
+            mkdir -p work
+            dd if=/dev/zero of=work/base.img bs=1m count=0 seek=2048
+            newfs -F -s 4194304 -O 2 -B be -b 16384 -f 4096 -i 1048576 work/base.img
+            echo "::warning title=dumpfs::$(dumpfs -s work/base.img 2>&1 | head -24 | tr '\n' '|')"
+            echo "== baseline fsck"
+            fsck_ffs -n -f work/base.img
+
+      - name: Run writer harness against the image
+        run: |
+          cp --sparse=always work/base.img work/test.img
+          dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- work/test.img work/snapshots
+
+      # The VM only receives the workspace when it starts, so each snapshot is streamed
+      # over the VM's ssh connection (sparse-aware tar), checked, then deleted, one at a
+      # time to stay within the VM's disk space.
+      - name: fsck_ffs every snapshot (inside NetBSD)
+        run: |
+          ssh -q -T netbsd 'rm -rf /var/tmp/fsck && mkdir -p /var/tmp/fsck && df -h /var/tmp' 2>&1 | tr -d '\r' > df.txt || true
+          echo "::notice title=VM disk::$(tr '\n' '|' < df.txt)"
+          status=0
+          for img in work/snapshots/*.img; do
+            name=$(basename "$img")
+            if ! tar -cSf - -C work/snapshots "$name" | gzip -1 | ssh -q -T netbsd 'cd /var/tmp/fsck && gunzip | tar -xf -' 2> copy.err; then
+              echo "::error title=copy $name to VM failed::$(tr '\n' '|' < copy.err | cut -c1-800)"
+              status=1; continue
+            fi
+            ssh -q -T netbsd "fsck_ffs -n -f /var/tmp/fsck/$name; echo EXIT=\$?; rm -f /var/tmp/fsck/$name" 2>&1 | tr -d '\r' > fsck.out
+            cat fsck.out
+            rc=$(sed -n 's/^EXIT=//p' fsck.out | tail -n 1)
+            # fsck warns that an image file is not a character device and auto-answers
+            # "CONTINUE? yes"; that is expected and not a filesystem problem.
+            out=$(grep -v '^EXIT=' fsck.out | grep -v 'DIOCGDINFO' | grep -v 'is not a character device' | grep -v '^CONTINUE? yes')
+            if echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
+              bad=1
+            else
+              bad=0
+            fi
+            summary=$(echo "$out" | grep -v '^\*\*' | tr '\n' '|' | cut -c1-3000)
+            case "$name" in
+              *control*)
+                # Negative control: fsck MUST report the planted corruption.
+                if [ $bad -eq 1 ]; then
+                  echo "::notice title=fsck control ($name)::detected the planted corruption as expected: $summary"
+                else
+                  echo "::error title=fsck control ($name)::fsck did NOT detect the planted corruption, so the check is not working: $summary"
+                  status=1
+                fi ;;
+              *)
+                if [ $bad -eq 1 ]; then
+                  echo "::error title=fsck_ffs found problems in $name (exit ${rc:-?})::$summary"
+                  status=1
+                else
+                  echo "::notice title=fsck clean ($name)::$summary"
+                fi ;;
+            esac
+          done
+          exit $status

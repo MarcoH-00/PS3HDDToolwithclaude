@@ -211,7 +211,7 @@ public class Ufs2Writer
                 _protectedFragments.Add(frag);
             }
         }
-        catch { }
+        catch (Exception ex) { _log($"  NOTE could not read inode {inodeNumber} to protect its blocks: {ex.Message}"); }
     }
 
     public Ufs2Writer(Ufs2FileSystem fs, IDiskSource disk, long partitionOffsetBytes, bool dryRun, Action<string> log)
@@ -239,6 +239,295 @@ public class Ufs2Writer
                 _encPingPongPtr = null;
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Safety helpers (fork hardening, phase 1)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// When true (default), allocation bitmaps and file data are forced to disk before
+    /// any inode or directory entry that points at them is written, and directory
+    /// entries are removed before the inode and blocks they name are released.
+    /// A crash then leaves at worst leaked space (which fsck reclaims), never a live
+    /// file pointing at blocks the allocator considers free.
+    /// </summary>
+    public bool SafeWriteOrdering { get; set; } = true;
+
+    /// <summary>Maximum UFS2 name length in bytes (MAXNAMLEN).</summary>
+    public const int MaxNameBytes = 255;
+
+    /// <summary>
+    /// Reject names the on-disk format or the PS3 cannot represent.
+    /// </summary>
+    public static byte[] ValidateEntryName(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            throw new ArgumentException("Name cannot be empty.", nameof(name));
+        if (name == "." || name == "..")
+            throw new ArgumentException($"'{name}' is reserved.", nameof(name));
+        if (name.IndexOf('/') >= 0 || name.IndexOf('\0') >= 0)
+            throw new ArgumentException("Name cannot contain '/' or NUL characters.", nameof(name));
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(name);
+        if (bytes.Length > MaxNameBytes)
+            throw new ArgumentException($"Name is {bytes.Length} bytes in UTF-8; the limit is {MaxNameBytes}.", nameof(name));
+        return bytes;
+    }
+
+    private static bool NameEquals(byte[] block, int offset, int nameLen, byte[] nameBytes)
+    {
+        if (nameLen != nameBytes.Length || offset + nameLen > block.Length) return false;
+        return block.AsSpan(offset, nameLen).SequenceEqual(nameBytes);
+    }
+
+    /// <summary>
+    /// Push pending file data and dirty cylinder groups to the disk and wait until the
+    /// disk reports them stable. Call before writing metadata that references them.
+    /// </summary>
+    public void DurabilityBarrier()
+    {
+        if (_dryRun) return;
+        FlushDataBatch();
+        FlushDirtyCgs();
+        _disk.Flush();
+    }
+
+    private long InodeDiskOffset(long inodeNumber)
+    {
+        var sb = _fs.Superblock!;
+        return _partitionOffset + (inodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
+            + sb.InodeBlockOffset * sb.FragmentSize + (inodeNumber % sb.InodesPerGroup) * sb.InodeSize;
+    }
+
+    private byte[] ReadRawInode(long inodeNumber)
+        => _disk.ReadBytes(InodeDiskOffset(inodeNumber), (int)_fs.Superblock!.InodeSize);
+
+    private void CheckFragmentAddress(long absFrag, int count, string what)
+    {
+        var sb = _fs.Superblock!;
+        long total = sb.TotalFragments > 0 ? sb.TotalFragments : (long)sb.CylinderGroups * sb.FragsPerGroup;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        if (absFrag <= 0 || count <= 0 || count > fpb || absFrag + count > total)
+            throw new InvalidDataException($"{what} points outside the filesystem (fragment 0x{absFrag:X}, count {count}).");
+        if ((absFrag % sb.FragsPerGroup) + count > sb.FragsPerGroup)
+            throw new InvalidDataException($"{what} crosses a cylinder group boundary (fragment 0x{absFrag:X}).");
+        if ((absFrag % fpb) + count > fpb)
+            throw new InvalidDataException($"{what} crosses a block boundary (fragment 0x{absFrag:X}, count {count}).");
+    }
+
+    private bool IsFragmentFree(CylinderGroupInfo cg, int localFrag)
+        => (cg.RawData[cg.FreeBlocksOffset + (localFrag / 8)] & (1 << (localFrag % 8))) != 0;
+
+    /// <summary>Mark an allocated run (all inside one block) free again.</summary>
+    private void FreeFragmentRun(long absFrag, int count)
+    {
+        var sb = _fs.Superblock!;
+        int cgNum = (int)(absFrag / sb.FragsPerGroup);
+        int local = (int)(absFrag % sb.FragsPerGroup);
+        var cg = ReadCylinderGroup(cgNum);
+        MarkFragmentsFree(cg, local, count);
+        WriteCylinderGroup(cg);
+    }
+
+    /// <summary>
+    /// Allocate an inode, preferring <paramref name="preferredCg"/> and falling back to
+    /// every other cylinder group (FFS ffs_hashalloc behaviour). Fixes upstream issue #7
+    /// ("No free inodes in CG") where installs failed once the parent's group filled up.
+    /// </summary>
+    private int FindFreeInodeAnyCg(int preferredCg, out int inodeCg, out CylinderGroupInfo inodeCgInfo)
+    {
+        var sb = _fs.Superblock!;
+        for (int i = 0; i < sb.CylinderGroups; i++)
+        {
+            int tryCg = (preferredCg + i) % sb.CylinderGroups;
+            var info = ReadCylinderGroup(tryCg);
+            if (info.Magic != 0x00090255) continue;
+            if (info.FreeInodes <= 0 && i > 0) continue; // header says full: skip the bitmap scan
+            int idx = FindFreeInode(info);
+            if (idx < 0) continue;
+            if (tryCg == 0 && idx < 3) continue; // inodes 0-2 are reserved (root is 2)
+            inodeCg = tryCg;
+            inodeCgInfo = info;
+            if (i > 0) _log($"  CG {preferredCg} has no free inodes; using CG {tryCg}");
+            return idx;
+        }
+        throw new IOException("No free inodes left on the filesystem.");
+    }
+
+    /// <summary>
+    /// Give back blocks pre-reserved by the batch allocator but never used. Before this,
+    /// they stayed marked "in use" with no owner (space leak, fsck "BLK(S) MISSING").
+    /// </summary>
+    private void ReleaseBatchReservation()
+    {
+        if (_batchAllocRemaining > 0 && _batchAllocCg >= 0)
+        {
+            var sb = _fs.Superblock!;
+            int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+            var cg = ReadCylinderGroup(_batchAllocCg);
+            for (int i = 0; i < _batchAllocRemaining; i++)
+                MarkFragmentsFree(cg, (int)(_batchAllocNextFrag + (long)i * fpb), fpb);
+            WriteCylinderGroup(cg);
+            _log($"  Released {_batchAllocRemaining} unused reserved block(s) in CG {_batchAllocCg}");
+        }
+        _batchAllocRemaining = 0;
+        _batchAllocNextFrag = -1;
+        _batchAllocCg = -1;
+    }
+
+    /// <summary>
+    /// Rebuild a cylinder group's derived summary fields from its bitmaps, the way
+    /// fsck_ffs pass 5 does: cs_nbfree, cs_nffree, cs_nifree, cg_frsum, the cluster
+    /// bitmap and cg_clustersum. The incremental updates elsewhere had gaps (freeing a
+    /// block never updated the cluster summary, for example); recomputing before every
+    /// CG write makes those counters correct by construction.
+    /// cs_ndir is not derivable from the bitmaps and is still maintained incrementally.
+    /// </summary>
+    public void RecomputeCgSummary(CylinderGroupInfo cg)
+    {
+        if (cg.Magic != 0x00090255) return;
+        var sb = _fs.Superblock!;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        byte[] d = cg.RawData;
+        int ndblk = BinaryPrimitives.ReadInt32BigEndian(d.AsSpan(0x14));
+        int freeoff = cg.FreeBlocksOffset;
+        if (ndblk <= 0 || freeoff <= 0 || freeoff + (ndblk + 7) / 8 > d.Length) return;
+
+        int clusteroff = BinaryPrimitives.ReadInt32BigEndian(d.AsSpan(0x6C));
+        int clustersumoff = BinaryPrimitives.ReadInt32BigEndian(d.AsSpan(0x68));
+        int nclusterblks = BinaryPrimitives.ReadInt32BigEndian(d.AsSpan(0x70));
+        bool clusters = clusteroff > 0 && clustersumoff > 0 && nclusterblks > 0
+            && clusteroff > clustersumoff && clusteroff + (nclusterblks + 7) / 8 <= d.Length;
+
+        int nbfree = 0, nffree = 0;
+        var frsum = new int[8];
+        int blk = 0;
+        for (int start = 0; start < ndblk; start += fpb, blk++)
+        {
+            int frags = Math.Min(fpb, ndblk - start);
+            int free = 0, run = 0;
+            for (int f = start; f < start + frags; f++)
+            {
+                if ((d[freeoff + (f / 8)] & (1 << (f % 8))) != 0) { free++; run++; }
+                else { if (run > 0 && run < fpb) frsum[run]++; run = 0; }
+            }
+            bool wholeBlockFree = free == fpb;
+            if (wholeBlockFree) nbfree++;
+            else
+            {
+                if (run > 0 && run < fpb) frsum[run]++;
+                nffree += free;
+            }
+            if (clusters && blk < nclusterblks)
+            {
+                int cb = clusteroff + (blk / 8);
+                if (wholeBlockFree) d[cb] |= (byte)(1 << (blk % 8));
+                else d[cb] &= (byte)~(1 << (blk % 8));
+            }
+        }
+
+        BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(0x1C), nbfree);
+        BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(0x24), nffree);
+        cg.FreeBlocks = nbfree;
+        for (int i = 0; i < 8; i++)
+            BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(0x34 + i * 4), i < fpb ? frsum[i] : 0);
+
+        if (clusters)
+        {
+            int contigsumsize = (clusteroff - clustersumoff) / 4 - 1;
+            if (contigsumsize > 0)
+            {
+                var sums = new int[contigsumsize + 1];
+                int run = 0;
+                for (int b = 0; b < nclusterblks; b++)
+                {
+                    if ((d[clusteroff + (b / 8)] & (1 << (b % 8))) != 0) run++;
+                    else if (run > 0) { sums[Math.Min(run, contigsumsize)]++; run = 0; }
+                }
+                if (run > 0) sums[Math.Min(run, contigsumsize)]++;
+                // Index 0 is never written: newfs places cg_clustersumoff 4 bytes early so
+                // that unused slot overlaps the tail of the free-fragment bitmap.
+                for (int i = 1; i <= contigsumsize; i++)
+                    BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(clustersumoff + i * 4), sums[i]);
+            }
+        }
+
+        int ipg = (int)sb.InodesPerGroup;
+        int iusedoff = cg.InodesUsedOffset;
+        if (iusedoff > 0 && iusedoff + (ipg + 7) / 8 <= d.Length)
+        {
+            int nifree = 0;
+            for (int i = 0; i < ipg; i++)
+                if ((d[iusedoff + (i / 8)] & (1 << (i % 8))) == 0) nifree++;
+            BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(0x20), nifree);
+            cg.FreeInodes = nifree;
+        }
+    }
+
+    /// <summary>Location of a named entry inside a directory's data.</summary>
+    private sealed class EntryLocation
+    {
+        public int BlockIndex;
+        public long BlockDiskOffset;
+        public byte[] Block = Array.Empty<byte>();
+        public int Offset;
+        public int PrevOffset;   // previous live entry in the same 512-byte section, or -1
+        public uint Inode;
+        public byte Type;
+    }
+
+    private EntryLocation? LocateEntry(long dirInodeNumber, byte[] nameBytes)
+    {
+        var sb = _fs.Superblock!;
+        var dir = _fs.ReadInode(dirInodeNumber);
+        if (dir.FileType != Ufs2FileType.Directory)
+            throw new IOException($"Inode {dirInodeNumber} is not a directory.");
+        long bytesLeft = dir.Size;
+        long allocBytes = dir.Blocks * 512;
+
+        for (int i = 0; i < 12 && bytesLeft > 0; i++)
+        {
+            long blockAddr = dir.DirectBlocks[i];
+            if (blockAddr == 0) break;
+            int blockCapacity = (int)sb.BlockSize; // reads are bounded by di_size below
+            int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
+            long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
+            byte[] block = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
+
+            for (int sectionStart = 0; sectionStart + 512 <= thisBlockSize; sectionStart += 512)
+            {
+                int sectionEnd = sectionStart + 512;
+                int offset = sectionStart, prev = -1;
+                while (offset + 8 <= sectionEnd)
+                {
+                    uint ino = BinaryPrimitives.ReadUInt32BigEndian(block.AsSpan(offset));
+                    ushort recLen = BinaryPrimitives.ReadUInt16BigEndian(block.AsSpan(offset + 4));
+                    if (recLen < 8 || offset + recLen > sectionEnd)
+                        throw new InvalidDataException($"Corrupt directory record in inode {dirInodeNumber} (block {i}, offset {offset}).");
+                    byte nameLen = block[offset + 7];
+                    if (ino != 0 && NameEquals(block, offset + 8, nameLen, nameBytes))
+                    {
+                        return new EntryLocation
+                        {
+                            BlockIndex = i, BlockDiskOffset = blockDiskOffset, Block = block,
+                            Offset = offset, PrevOffset = prev, Inode = ino, Type = block[offset + 6]
+                        };
+                    }
+                    if (ino != 0) prev = offset;
+                    offset += recLen;
+                }
+            }
+            bytesLeft -= thisBlockSize;
+        }
+        return null;
+    }
+
+    /// <summary>Inode number of ".." inside a directory, read from its first record.</summary>
+    private long ReadParentOf(long dirInodeNumber)
+    {
+        var dotdot = LocateEntry(dirInodeNumber, new[] { (byte)'.', (byte)'.' });
+        if (dotdot == null) throw new InvalidDataException($"Directory inode {dirInodeNumber} has no '..' entry.");
+        return dotdot.Inode;
     }
 
     /// <summary>
@@ -445,174 +734,86 @@ public class Ufs2Writer
             _cgSearchCursor[cg.CgNumber] = runStartFrag + runBlocks * fragsPerBlock;
             return (runStartFrag, runBlocks);
         }
+        // Nothing after the cursor: wrap once so space freed earlier in the group is reused.
+        if (startFrom > _cachedDblkno + fragsPerBlock && _cgSearchCursor.Remove(cg.CgNumber))
+            return FindFreeBlockRun(cg, fragsPerBlock, maxBlocks);
         return (-1, 0);
     }
 
     public long FindFreeFragments(CylinderGroupInfo cg, int count)
     {
+        // FFS rule: a run of fragments must lie inside one block, and a full-block
+        // allocation must be block-aligned. Upstream's linear scan could return a run
+        // that straddled two blocks (found by fsck in CI), which the kernel treats as
+        // two half-owned blocks. Partial blocks are preferred for fragment runs so
+        // whole blocks stay available for large files, as ffs_alloccg does.
         var sb = _fs.Superblock!;
-        int fpg = (int)sb.FragsPerGroup;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        if (count <= 0 || count > fpb)
+            throw new ArgumentOutOfRangeException(nameof(count), $"Fragment runs must be 1..{fpb} fragments.");
+
+        int ndblk = BinaryPrimitives.ReadInt32BigEndian(cg.RawData.AsSpan(0x14));
+        if (ndblk <= 0 || ndblk > sb.FragsPerGroup) ndblk = (int)sb.FragsPerGroup;
+        int nblocks = ndblk / fpb;
+        if (nblocks <= 0) return -1;
         int bitmapOffset = cg.FreeBlocksOffset;
-        int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
+        if (bitmapOffset + (ndblk + 7) / 8 > cg.RawData.Length) return -1;
+        long cgBase = (long)cg.CgNumber * sb.FragsPerGroup;
 
-        if (_cachedDblkno < 0)
-            _cachedDblkno = BinaryPrimitives.ReadInt32BigEndian(_fs.RawSuperblockData.AsSpan(0x14));
+        int startBlock = 0;
+        if (_cgSearchCursor.TryGetValue(cg.CgNumber, out int cursor) && cursor > 0)
+            startBlock = (cursor / fpb) % nblocks;
 
-        // UFS2 rule: full-block allocations (count >= fragsPerBlock) MUST be block-aligned.
-        // Fragment allocations (count < fragsPerBlock, e.g. for directories) can start anywhere.
-        bool requireBlockAlign = (count >= fragsPerBlock);
+        bool Usable(int localFrag)
+            => (cg.RawData[bitmapOffset + (localFrag / 8)] & (1 << (localFrag % 8))) != 0
+               && !_protectedFragments.Contains(cgBase + localFrag);
 
-        // Start from cursor if available
-        int startFrom = _cachedDblkno;
-        if (_cgSearchCursor.TryGetValue(cg.CgNumber, out int cursor) && cursor > startFrom)
-            startFrom = cursor;
-
-        // If block alignment required, round up startFrom to next block boundary
-        if (requireBlockAlign && (startFrom % fragsPerBlock) != 0)
-            startFrom = ((startFrom / fragsPerBlock) + 1) * fragsPerBlock;
-
-        int consecutive = 0;
-        int startFrag = -1;
-
-        for (int f = startFrom; f < fpg; f++)
+        int firstWholeBlock = -1;
+        for (int k = 0; k < nblocks; k++)
         {
-            int byteIdx = bitmapOffset + (f / 8);
-            if (byteIdx >= cg.RawData.Length) break;
+            int b = (startBlock + k) % nblocks;
+            int blockStart = b * fpb;
+            if (cg.RawData[bitmapOffset + (blockStart / 8)] == 0 && fpb <= 8 && (blockStart % 8) + fpb <= 8)
+                continue; // whole bitmap byte used: nothing free in this block
 
-            // Skip fully-used bytes
-            if (consecutive == 0 && (f % 8) == 0 && cg.RawData[byteIdx] == 0x00)
+            int free = 0;
+            for (int j = 0; j < fpb; j++) if (Usable(blockStart + j)) free++;
+            if (free == 0) continue;
+
+            if (free == fpb)
             {
-                f += 7;
-                // After skipping, re-align if needed
-                if (requireBlockAlign && consecutive == 0)
+                if (count == fpb)
                 {
-                    int nextAligned = (((f + 1) / fragsPerBlock) + 1) * fragsPerBlock;
-                    if (nextAligned > f + 1) f = nextAligned - 1; // -1 because loop increments
+                    _cgSearchCursor[cg.CgNumber] = blockStart + fpb;
+                    return blockStart;
                 }
+                if (firstWholeBlock < 0) firstWholeBlock = blockStart;
                 continue;
             }
+            if (count == fpb) continue;
 
-            int bitIdx = f % 8;
-            bool isFree = (cg.RawData[byteIdx] & (1 << bitIdx)) != 0;
-
-            if (isFree)
+            // Partially used block: look for `count` free fragments in a row inside it.
+            int run = 0;
+            for (int j = 0; j < fpb; j++)
             {
-                long globalFrag = (long)cg.CgNumber * sb.FragsPerGroup + f;
-                if (_protectedFragments.Contains(globalFrag))
+                if (Usable(blockStart + j))
                 {
-                    consecutive = 0;
-                    if (requireBlockAlign)
+                    if (++run >= count)
                     {
-                        // Skip to next block boundary
-                        int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                        f = nextAligned - 1;
+                        int found = blockStart + j - count + 1;
+                        _cgSearchCursor[cg.CgNumber] = blockStart;
+                        return found;
                     }
                 }
-                else
-                {
-                    if (consecutive == 0)
-                    {
-                        // For block-aligned allocations, only start on block boundaries
-                        if (requireBlockAlign && (f % fragsPerBlock) != 0)
-                        {
-                            // Skip to next block boundary
-                            int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                            f = nextAligned - 1;
-                            continue;
-                        }
-                        startFrag = f;
-                    }
-                    consecutive++;
-                    if (consecutive >= count)
-                    {
-                        _cgSearchCursor[cg.CgNumber] = startFrag + count;
-                        return startFrag;
-                    }
-                }
-            }
-            else
-            {
-                consecutive = 0;
-                if (requireBlockAlign)
-                {
-                    // Skip to next block boundary
-                    int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                    f = nextAligned - 1;
-                }
+                else run = 0;
             }
         }
 
-        // Wrap around if cursor was past start
-        if (startFrom > _cachedDblkno)
+        if (count < fpb && firstWholeBlock >= 0)
         {
-            consecutive = 0;
-            int wrapStart = _cachedDblkno;
-            if (requireBlockAlign && (wrapStart % fragsPerBlock) != 0)
-                wrapStart = ((wrapStart / fragsPerBlock) + 1) * fragsPerBlock;
-
-            for (int f = wrapStart; f < startFrom; f++)
-            {
-                int byteIdx = bitmapOffset + (f / 8);
-                if (byteIdx >= cg.RawData.Length) break;
-
-                if (consecutive == 0 && (f % 8) == 0 && cg.RawData[byteIdx] == 0x00)
-                {
-                    f += 7;
-                    if (requireBlockAlign && consecutive == 0)
-                    {
-                        int nextAligned = (((f + 1) / fragsPerBlock) + 1) * fragsPerBlock;
-                        if (nextAligned > f + 1) f = nextAligned - 1;
-                    }
-                    continue;
-                }
-
-                int bitIdx = f % 8;
-                bool isFree = (cg.RawData[byteIdx] & (1 << bitIdx)) != 0;
-
-                if (isFree)
-                {
-                    long globalFrag = (long)cg.CgNumber * sb.FragsPerGroup + f;
-                    if (_protectedFragments.Contains(globalFrag))
-                    {
-                        consecutive = 0;
-                        if (requireBlockAlign)
-                        {
-                            int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                            f = nextAligned - 1;
-                        }
-                    }
-                    else
-                    {
-                        if (consecutive == 0)
-                        {
-                            if (requireBlockAlign && (f % fragsPerBlock) != 0)
-                            {
-                                int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                                f = nextAligned - 1;
-                                continue;
-                            }
-                            startFrag = f;
-                        }
-                        consecutive++;
-                        if (consecutive >= count)
-                        {
-                            _cgSearchCursor[cg.CgNumber] = startFrag + count;
-                            return startFrag;
-                        }
-                    }
-                }
-                else
-                {
-                    consecutive = 0;
-                    if (requireBlockAlign)
-                    {
-                        int nextAligned = ((f / fragsPerBlock) + 1) * fragsPerBlock;
-                        f = nextAligned - 1;
-                    }
-                }
-            }
+            _cgSearchCursor[cg.CgNumber] = firstWholeBlock;
+            return firstWholeBlock;
         }
-
         return -1;
     }
 
@@ -931,8 +1132,18 @@ public class Ufs2Writer
         // Update timestamps in memory regardless of defer mode
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         BinaryPrimitives.WriteInt32BigEndian(cg.RawData.AsSpan(0x08), (int)now);
-        if (cg.RawData.Length > 0x98)
-            BinaryPrimitives.WriteInt64BigEndian(cg.RawData.AsSpan(0x90), now);
+        // UFS2 cg_time is the int64 at 0x88 (FreeBSD/NetBSD struct cg); 0x90 is spare
+        // space that fsck expects to stay untouched ("SUMMARY INFORMATION BAD").
+        // Upstream always wrote 0x90, so update whichever slot already holds a
+        // plausible timestamp and fall back to the standard 0x88.
+        if (cg.RawData.Length >= 0x98)
+        {
+            static bool Plausible(long t) => t > 946_684_800 && t < 4_102_444_800; // 2000..2100
+            long at88 = BinaryPrimitives.ReadInt64BigEndian(cg.RawData.AsSpan(0x88));
+            long at90 = BinaryPrimitives.ReadInt64BigEndian(cg.RawData.AsSpan(0x90));
+            int slot = Plausible(at90) && !Plausible(at88) ? 0x90 : 0x88;
+            BinaryPrimitives.WriteInt64BigEndian(cg.RawData.AsSpan(slot), now);
+        }
         
         if (DeferCgWrites)
         {
@@ -940,6 +1151,7 @@ public class Ufs2Writer
         }
         else
         {
+            RecomputeCgSummary(cg);
             QueueWrite(cg.DiskOffset, cg.RawData, $"CG {cg.CgNumber} header ({cg.RawData.Length} bytes)");
             _dirtyCgs.Remove(cg.CgNumber);
         }
@@ -955,6 +1167,7 @@ public class Ufs2Writer
         {
             if (_cgCache.TryGetValue(cgNum, out var cg))
             {
+                RecomputeCgSummary(cg);
                 QueueWrite(cg.DiskOffset, cg.RawData, $"CG {cg.CgNumber} header (deferred flush)");
             }
         }
@@ -1223,23 +1436,22 @@ public class Ufs2Writer
     /// </summary>
     public bool DirectoryContainsEntry(long dirInodeNumber, string name)
     {
-        try
+        // Read errors propagate: treating an unreadable directory as "no such name"
+        // (upstream behaviour) could create a duplicate entry.
+        var inode = _fs.ReadInode(dirInodeNumber);
+        var entries = _fs.ReadDirectory(inode);
+        foreach (var entry in entries)
         {
-            var inode = _fs.ReadInode(dirInodeNumber);
-            var entries = _fs.ReadDirectory(inode);
-            foreach (var entry in entries)
-            {
-                if (entry.Name == name)
-                    return true;
-            }
+            if (entry.Name == name)
+                return true;
         }
-        catch { }
         return false;
     }
 
     public long CreateDirectory(long parentInodeNumber, string name)
     {
         var sb = _fs.Superblock!;
+        ValidateEntryName(name);
         _log($"[WRITE] Creating directory '{name}' in inode {parentInodeNumber}");
 
         // Check for duplicate entry
@@ -1365,7 +1577,20 @@ public class Ufs2Writer
         long absFragAddr = (long)blockCg * sb.FragsPerGroup + freeFrag;
         _log($"  Allocating fragment at frag 0x{absFragAddr:X} (CG {blockCg}, frag {freeFrag})");
 
-        // 4. Build the directory data block with "." and ".."
+        // 4. Claim the inode and the data fragment in the CG bitmaps FIRST.
+        // MarkInodeUsed may zero whole inode blocks when it extends cg_initediblk, so it
+        // must run before the new inode is written (upstream wrote the inode first and
+        // could wipe it right afterwards).
+        MarkInodeUsed(inodeCgInfo, freeIdx);
+        int ndirCount = BinaryPrimitives.ReadInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18));
+        BinaryPrimitives.WriteInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18), ndirCount + 1);
+        MarkFragmentUsed(blockCgInfo, (int)freeFrag);
+        WriteCylinderGroup(inodeCgInfo);
+        if (blockCg != inodeCg)
+            WriteCylinderGroup(blockCgInfo);
+        _log($"  Updated CG bitmaps");
+
+        // 5. Build the directory data block with "." and ".."
         // Directory is 512 bytes but we write a full fragment (4096)
         byte[] dirBlock = BuildEmptyDirectoryBlock(newInodeNumber, parentInodeNumber);
         if (VerboseLog)
@@ -1376,7 +1601,10 @@ public class Ufs2Writer
         }
         WriteDataBlock(absFragAddr, dirBlock);
 
-        // 5. Build and write the new inode
+        // Bitmaps and the directory block must be stable before the inode points at them.
+        if (SafeWriteOrdering) DurabilityBarrier();
+
+        // 6. Build and write the new inode
         // PS3 native uses 0x41FF for ALL game-related directories including game/ itself
         ushort dirMode = (ushort)0x41FF;
         byte[] inodeData = BuildDirectoryInode(absFragAddr, 2, dirMode); // nlink=2 (self + ".")
@@ -1387,25 +1615,6 @@ public class Ufs2Writer
                 _log($"    0x{r:X2}: {BitConverter.ToString(inodeData, r, Math.Min(32, inodeData.Length - r))}");
         }
         WriteInode(newInodeNumber, inodeData);
-
-        // 6. Update CG bitmaps — mark full block used for directory
-        MarkInodeUsed(inodeCgInfo, freeIdx);
-        if (blockCg == inodeCg)
-        {
-            MarkFragmentUsed(inodeCgInfo, (int)freeFrag);
-            int ndir = BinaryPrimitives.ReadInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18));
-            BinaryPrimitives.WriteInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18), ndir + 1);
-            WriteCylinderGroup(inodeCgInfo);
-        }
-        else
-        {
-            int ndir = BinaryPrimitives.ReadInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18));
-            BinaryPrimitives.WriteInt32BigEndian(inodeCgInfo.RawData.AsSpan(0x18), ndir + 1);
-            WriteCylinderGroup(inodeCgInfo);
-            MarkFragmentUsed(blockCgInfo, (int)freeFrag);
-            WriteCylinderGroup(blockCgInfo);
-        }
-        _log($"  Updated CG bitmaps");
 
         // 7. Add entry to parent directory (try existing blocks, expand if needed)
         _log($"  Adding '{name}' to parent directory (inode {parentInodeNumber})");
@@ -1446,7 +1655,59 @@ public class Ufs2Writer
     /// <summary>
     /// High-level: Write a file from a host stream into the filesystem.
     /// </summary>
+    /// <summary>Bookkeeping for one WriteFile call so a failure can be undone.</summary>
+    private sealed class WriteFileState
+    {
+        public readonly List<(long AbsFrag, int Count)> Allocated = new();
+        public long InodeNumber = -1;
+        public bool InodeMarked;
+        public bool InodeWritten;
+        public bool Linked;
+    }
+
     public long WriteFile(long parentInodeNumber, string name, Stream sourceData, long fileSize)
+    {
+        ValidateEntryName(name);
+        if (fileSize < 0) throw new ArgumentOutOfRangeException(nameof(fileSize));
+        // Never inherit a reservation left behind by an earlier, failed call.
+        ReleaseBatchReservation();
+        var state = new WriteFileState();
+        try
+        {
+            long ino = WriteFileCore(parentInodeNumber, name, sourceData, fileSize, state);
+            ReleaseBatchReservation();
+            return ino;
+        }
+        catch (Exception ex) when (!state.Linked)
+        {
+            _log($"  ERROR writing '{name}': {ex.Message} — rolling back its allocations");
+            RollbackWriteFile(state);
+            throw;
+        }
+    }
+
+    private void RollbackWriteFile(WriteFileState state)
+    {
+        var sb = _fs.Superblock!;
+        try { FlushDataBatch(); } catch (Exception flushEx) { _log($"  (data flush during rollback failed: {flushEx.Message})"); }
+        ReleaseBatchReservation();
+        foreach (var (absFrag, count) in state.Allocated)
+            FreeFragmentRun(absFrag, count);
+        if (state.InodeMarked && state.InodeNumber >= 0)
+        {
+            var icg = ReadCylinderGroup((int)(state.InodeNumber / sb.InodesPerGroup));
+            MarkInodeFree(icg, (int)(state.InodeNumber % sb.InodesPerGroup));
+            WriteCylinderGroup(icg);
+        }
+        if (state.InodeWritten && state.InodeNumber >= 0)
+        {
+            WriteInode(state.InodeNumber, new byte[(int)sb.InodeSize]);
+            DurabilityBarrier();
+        }
+        _log($"  Rolled back {state.Allocated.Count} allocation(s)");
+    }
+
+    private long WriteFileCore(long parentInodeNumber, string name, Stream sourceData, long fileSize, WriteFileState state)
     {
         var sb = _fs.Superblock!;
         _log($"[WRITE] Writing file '{name}' ({fileSize} bytes) into inode {parentInodeNumber}");
@@ -1456,10 +1717,6 @@ public class Ufs2Writer
             throw new IOException($"Directory already contains a file named '{name}'");
 
         int parentCg = (int)(parentInodeNumber / sb.InodesPerGroup);
-        var cg = ReadCylinderGroup(parentCg);
-
-        if (cg.Magic != 0x00090255)
-            throw new IOException($"CG {parentCg} has invalid magic: 0x{cg.Magic:X8}");
 
         // Protect directory fragments from PS3 bitmap inconsistencies
         _protectedFragments.Clear();
@@ -1467,15 +1724,19 @@ public class Ufs2Writer
         if (parentInodeNumber != 2)
             CollectProtectedFragments(parentInodeNumber);
 
-        // 1. Allocate inode
-        int freeIdx = FindFreeInode(cg);
-        if (freeIdx < 0) throw new IOException($"No free inodes in CG {parentCg}");
-        long newInodeNumber = (long)parentCg * sb.InodesPerGroup + freeIdx;
+        // 1. Allocate inode — parent's CG first, then any other CG (upstream issue #7)
+        int freeIdx = FindFreeInodeAnyCg(parentCg, out int inodeCg, out var cg);
+        long newInodeNumber = (long)inodeCg * sb.InodesPerGroup + freeIdx;
+        state.InodeNumber = newInodeNumber;
 
         // 2. Calculate blocks needed
         int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
         long blocksNeeded = (fileSize + sb.BlockSize - 1) / sb.BlockSize;
         int blockSize = (int)sb.BlockSize;
+        // Direct-only files end in a fragment "tail"; only count whole blocks when
+        // reserving runs, otherwise the block reserved for the tail is never used.
+        bool lastIsTail = blocksNeeded > 0 && blocksNeeded <= 12 && (fileSize % blockSize) != 0;
+        long fullBlocksNeeded = blocksNeeded - (lastIsTail ? 1 : 0);
 
         // 3. Allocate and write data blocks
         var directBlocks = new long[12];
@@ -1500,7 +1761,7 @@ public class Ufs2Writer
         if (needsIndirect)
             FlushDataBatch();
 
-        int currentCg = parentCg;
+        int currentCg = inodeCg;
         var currentCgInfo = cg;
 
         // Timing instrumentation
@@ -1558,7 +1819,7 @@ public class Ufs2Writer
             {
                 // Batch allocate: find a contiguous run of blocks
                 _batchAllocRemaining = 0; // invalidate stale batch
-                int wantBlocks = (int)Math.Min(blocksNeeded - b, 4096); // up to 4096 blocks at once
+                int wantBlocks = (int)Math.Max(1, Math.Min(fullBlocksNeeded - b, 4096)); // up to 4096 blocks at once
                 var (runStart, runCount) = FindFreeBlockRun(currentCgInfo, fragsPerBlock, wantBlocks);
                 if (runStart < 0 || runCount == 0)
                 {
@@ -1617,6 +1878,7 @@ public class Ufs2Writer
             }
 
             long absFragAddr = (long)currentCg * sb.FragsPerGroup + freeFrag;
+            state.Allocated.Add((absFragAddr, fragsThisBlock));
             swAlloc.Stop();
 
             // Tail block: flush any pending batch and write the tail separately
@@ -1638,6 +1900,8 @@ public class Ufs2Writer
                     totalRead += r;
                 }
                 swRead.Stop();
+                if (totalRead < toRead)
+                    throw new EndOfStreamException($"Source for '{name}' ended early ({fileSize - bytesRemaining + totalRead} of {fileSize} bytes); nothing was linked.");
                 bytesRemaining -= toRead;
 
                 if (!_dryRun)
@@ -1682,6 +1946,11 @@ public class Ufs2Writer
                 totalRead += r;
             }
             swRead.Stop();
+            if (totalRead < toRead)
+            {
+                _batchBlockCount++; // keep batch bookkeeping consistent before bailing out
+                throw new EndOfStreamException($"Source for '{name}' ended early ({fileSize - bytesRemaining + totalRead} of {fileSize} bytes); nothing was linked.");
+            }
             _batchBlockCount++;
             bytesRemaining -= toRead;
             } // end full-block branch
@@ -1717,6 +1986,7 @@ public class Ufs2Writer
                         }
                         indirectBlock = (long)currentCg * sb.FragsPerGroup + indFrag;
                         MarkFragmentsUsed(currentCgInfo, (int)indFrag, fragsPerBlock);
+                        state.Allocated.Add((indirectBlock, fragsPerBlock));
                         indirectBlockBuf = new byte[blockSize];
                     }
                     BinaryPrimitives.WriteInt64BigEndian(indirectBlockBuf!.AsSpan(ptrIdx * 8), absFragAddr);
@@ -1750,6 +2020,7 @@ public class Ufs2Writer
                         }
                         doubleIndirectBlock = (long)currentCg * sb.FragsPerGroup + diFrag;
                         MarkFragmentsUsed(currentCgInfo, (int)diFrag, fragsPerBlock);
+                        state.Allocated.Add((doubleIndirectBlock, fragsPerBlock));
                         doubleIndirectBuf = new byte[blockSize];
                     }
 
@@ -1774,6 +2045,7 @@ public class Ufs2Writer
                         }
                         long l1Addr = (long)currentCg * sb.FragsPerGroup + l1Frag;
                         MarkFragmentsUsed(currentCgInfo, (int)l1Frag, fragsPerBlock);
+                        state.Allocated.Add((l1Addr, fragsPerBlock));
 
                         currentL1Buf = new byte[blockSize];
                         BinaryPrimitives.WriteInt64BigEndian(doubleIndirectBuf!.AsSpan(l1Idx * 8), l1Addr);
@@ -1811,16 +2083,21 @@ public class Ufs2Writer
 
         // Write updated CG(s)
         WriteCylinderGroup(currentCgInfo);
-        if (currentCg != parentCg)
+        if (currentCg != inodeCg)
             WriteCylinderGroup(cg);
 
         // 4. Mark inode used
         MarkInodeUsed(cg, freeIdx);
+        state.InodeMarked = true;
         WriteCylinderGroup(cg);
+
+        // Data, indirect blocks and bitmaps must be on disk before the inode refers to them.
+        if (SafeWriteOrdering) DurabilityBarrier();
 
         // 5. Build and write inode
         byte[] inodeData = BuildFileInode(fileSize, directBlocks, indirectBlock, doubleIndirectBlock);
         WriteInode(newInodeNumber, inodeData);
+        state.InodeWritten = true;
         swMeta.Stop();
 
         // Dump the written inode for debugging
@@ -1835,7 +2112,8 @@ public class Ufs2Writer
         // 6. Add to parent directory
         swDir.Start();
         var parentInode = _fs.ReadInode(parentInodeNumber);
-        AddEntryToDirectory(parentInodeNumber, parentInode, newInodeNumber, name, 8, parentCg, cg, currentCg, currentCgInfo, fragsPerBlock, out var fileExpanded, out _);
+        AddEntryToDirectory(parentInodeNumber, parentInode, newInodeNumber, name, 8, inodeCg, cg, currentCg, currentCgInfo, fragsPerBlock, out var fileExpanded, out _);
+        state.Linked = true;
         swDir.Stop();
 
         swTotal.Stop();
@@ -1867,13 +2145,9 @@ public class Ufs2Writer
             if (blockAddr == 0) break;
             if (bytesLeft <= 0) break;
 
-            // Block 0 is 1 fragment until reallocated. Blocks 1+ are always full blocks.
-            long allocBytes = parentInode.Blocks * 512;
-            int blockCapacity;
-            if (i == 0 && allocBytes < sb.BlockSize)
-                blockCapacity = (int)sb.FragmentSize;
-            else
-                blockCapacity = (int)sb.BlockSize;
+            // di_size never exceeds what is allocated, so reading up to di_size is safe
+            // whether the last block is a fragment run or a whole block.
+            int blockCapacity = (int)sb.BlockSize;
             int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
             long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
             byte[] dirBlock = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
@@ -1892,233 +2166,169 @@ public class Ufs2Writer
             bytesLeft -= thisBlockSize;
         }
 
-        // All existing DIRBLKSIZ sections are full.
-        // Try growing within existing allocation, or reallocate block 0 from fragment to block.
-        long allocatedBytes = parentInode.Blocks * 512;
-        
-        // Case 1: Block 0 is still a fragment and it's full — reallocate to full block
-        if (allocatedBytes == sb.FragmentSize && dirSize >= sb.FragmentSize)
-        {
-            long blockAddr = parentInode.DirectBlocks[0];
-            _log($"  Reallocating block 0 from fragment to full block (di_size={dirSize})");
-            
-            int blk0Cg = (int)(blockAddr / sb.FragsPerGroup);
-            int blk0LocalFrag = (int)(blockAddr % sb.FragsPerGroup);
-            var blk0CgInfo = ReadCylinderGroup(blk0Cg);
-            
-            // Check if adjacent fragments are free — they might have been allocated to files
-            bool canExpandInPlace = true;
-            for (int f = 1; f < fragsPerBlock; f++)
-            {
-                int adjIdx = blk0LocalFrag + f;
-                int adjByte = blk0CgInfo.FreeBlocksOffset + (adjIdx / 8);
-                int adjBit = adjIdx % 8;
-                bool isFree = (blk0CgInfo.RawData[adjByte] & (1 << adjBit)) != 0;
-                if (!isFree)
-                {
-                    canExpandInPlace = false;
-                    _log($"  Adjacent fragment {f} (local {adjIdx}) is in use — must relocate directory block");
-                    break;
-                }
-            }
-            
-            // Read existing fragment data
-            long oldBlockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-            byte[] fragData = _disk.ReadBytes(oldBlockDiskOffset, (int)sb.FragmentSize);
-            byte[] fullBlock = new byte[(int)sb.BlockSize];
-            Array.Copy(fragData, 0, fullBlock, 0, fragData.Length);
-            
-            long newBlockAddr;
-            if (canExpandInPlace)
-            {
-                // Adjacent fragments are free — expand in place
-                for (int f = 1; f < fragsPerBlock; f++)
-                    MarkFragmentUsed(blk0CgInfo, blk0LocalFrag + f);
-                WriteCylinderGroup(blk0CgInfo);
-                newBlockAddr = blockAddr;
-            }
-            else
-            {
-                // Adjacent fragments occupied — allocate a new block elsewhere and move
-                long relocFrag = FindFreeFragments(blk0CgInfo, fragsPerBlock);
-                int relocCg = blk0Cg;
-                CylinderGroupInfo relocCgInfo = blk0CgInfo;
-                if (relocFrag < 0)
-                {
-                    for (int i = 1; i < sb.CylinderGroups; i++)
-                    {
-                        int tryCg = (blk0Cg + i) % sb.CylinderGroups;
-                        relocCgInfo = ReadCylinderGroup(tryCg);
-                        relocFrag = FindFreeFragments(relocCgInfo, fragsPerBlock);
-                        if (relocFrag >= 0) { relocCg = tryCg; break; }
-                    }
-                    if (relocFrag < 0) throw new IOException("No free blocks for directory reallocation.");
-                }
-                newBlockAddr = (long)relocCg * sb.FragsPerGroup + relocFrag;
-                
-                // Mark new block used
-                MarkFragmentsUsed(relocCgInfo, (int)relocFrag, fragsPerBlock);
-                WriteCylinderGroup(relocCgInfo);
-                
-                // Free old fragment
-                MarkFragmentFree(blk0CgInfo, blk0LocalFrag);
-                WriteCylinderGroup(blk0CgInfo);
-                
-                _log($"  Relocated directory block 0 from frag 0x{blockAddr:X} to 0x{newBlockAddr:X}");
-            }
-            
-            // Initialize ALL new DIRBLKSIZ sections with free-space entries (ino=0, reclen=512)
-            // This prevents reclen=0 infinite loops in directory scanners
-            for (int sec = (int)sb.FragmentSize; sec < fullBlock.Length; sec += 512)
-                BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sec + 4), 512);
-            
-            // Add new entry at first section past the original fragment
-            int sectionOffset = (int)sb.FragmentSize;
-            byte[] reallocNameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-            BinaryPrimitives.WriteUInt32BigEndian(fullBlock.AsSpan(sectionOffset), (uint)newInodeNumber);
-            BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sectionOffset + 4), 512);
-            fullBlock[sectionOffset + 6] = entryType;
-            fullBlock[sectionOffset + 7] = (byte)reallocNameBytes.Length;
-            Array.Copy(reallocNameBytes, 0, fullBlock, sectionOffset + 8, reallocNameBytes.Length);
-            
-            // Write full block to disk
-            long newBlockDiskOffset = _partitionOffset + newBlockAddr * sb.FragmentSize;
-            QueueWrite(newBlockDiskOffset, fullBlock, $"Realloc block 0 to full block + grow (add '{name}')");
-            
-            // Update inode: di_db[0] = new address, di_blocks = BlockSize/512, di_size += 512
-            var reallocRaw = _disk.ReadBytes(
-                _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-                (int)sb.InodeSize);
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x70), newBlockAddr); // di_db[0]
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x18), sb.BlockSize / 512);
-            long reallocOldSize = BinaryPrimitives.ReadInt64BigEndian(reallocRaw.AsSpan(0x10));
-            BinaryPrimitives.WriteInt64BigEndian(reallocRaw.AsSpan(0x10), reallocOldSize + 512);
-            WriteInode(parentInodeNumber, reallocRaw);
-            expanded = true;
-            expandedRawParent = reallocRaw;
-            _log($"  Reallocated block 0: di_blocks={sb.BlockSize / 512}, size {reallocOldSize} -> {reallocOldSize + 512}");
-            return;
-        }
-        
-        // Case 2: Grow within existing allocation (block 0 already reallocated, or blocks 1+)
-        if (dirSize < allocatedBytes)
-        {
-            long offset = 0;
-            for (int i = 0; i < 12; i++)
-            {
-                long blockAddr = parentInode.DirectBlocks[i];
-                if (blockAddr == 0) break;
-                
-                // Block 0 might still be a single fragment (allocatedBytes == FragmentSize)
-                // Only after Case 1 realloc does block 0 become a full block.
-                long blockAllocated;
-                if (i == 0 && allocatedBytes <= sb.FragmentSize)
-                    blockAllocated = sb.FragmentSize;
-                else if (i == 0 && allocatedBytes < sb.BlockSize)
-                    blockAllocated = allocatedBytes; // partially grown
-                else
-                    blockAllocated = sb.BlockSize;
-                
-                if (offset + blockAllocated > dirSize)
-                {
-                    long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-                    byte[] fullBlock = _disk.ReadBytes(blockDiskOffset, (int)blockAllocated);
-                    
-                    int sectionOffset = (int)(dirSize - offset);
-                    byte[] growNameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-                    
-                    Array.Clear(fullBlock, sectionOffset, 512);
-                    BinaryPrimitives.WriteUInt32BigEndian(fullBlock.AsSpan(sectionOffset), (uint)newInodeNumber);
-                    BinaryPrimitives.WriteUInt16BigEndian(fullBlock.AsSpan(sectionOffset + 4), 512);
-                    fullBlock[sectionOffset + 6] = entryType;
-                    fullBlock[sectionOffset + 7] = (byte)growNameBytes.Length;
-                    Array.Copy(growNameBytes, 0, fullBlock, sectionOffset + 8, growNameBytes.Length);
-                    
-                    QueueWrite(blockDiskOffset, fullBlock, $"Grow dir within block (add '{name}')");
-                    
-                    var growRawParent = _disk.ReadBytes(
-                        _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                        + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-                        (int)sb.InodeSize);
-                    long growOldSize = BinaryPrimitives.ReadInt64BigEndian(growRawParent.AsSpan(0x10));
-                    BinaryPrimitives.WriteInt64BigEndian(growRawParent.AsSpan(0x10), growOldSize + 512);
-                    WriteInode(parentInodeNumber, growRawParent);
-                    expanded = true;
-                    expandedRawParent = growRawParent;
-                    _log($"  Grew directory within block: size {growOldSize} -> {growOldSize + 512}");
-                    return;
-                }
-                offset += blockAllocated;
-            }
-        }
-
-        // All existing fragments are truly full — expand with a new full block
-        _log($"  All directory blocks full, expanding with new block (dirSize={dirSize})");
-
-        // Find the next free direct block slot
-        int newSlot = -1;
-        for (int i = 0; i < 12; i++)
-        {
-            if (parentInode.DirectBlocks[i] == 0) { newSlot = i; break; }
-        }
-        if (newSlot < 0)
-            throw new IOException("Directory has 12 direct blocks full — indirect directory blocks not supported yet.");
-
-        // Allocate a new data block (use blockCg or scan for free)
-        long newFrag = FindFreeFragments(blockCgInfo, fragsPerBlock);
-        int allocCg = blockCg;
-        if (newFrag < 0)
-        {
-            for (int i = 1; i < sb.CylinderGroups; i++)
-            {
-                int tryCg = (blockCg + i) % sb.CylinderGroups;
-                var tryCgInfo = ReadCylinderGroup(tryCg);
-                newFrag = FindFreeFragments(tryCgInfo, fragsPerBlock);
-                if (newFrag >= 0) { allocCg = tryCg; blockCgInfo = tryCgInfo; break; }
-            }
-            if (newFrag < 0) throw new IOException("No free blocks for directory expansion.");
-        }
-        long newAbsFrag = (long)allocCg * sb.FragsPerGroup + newFrag;
-
-        // Build a new directory block with one entry in a single DIRBLKSIZ (512-byte) section
-        // Initialize all sections with free-space entries to prevent reclen=0 loops
-        byte[] newBlock = new byte[(int)sb.BlockSize];
-        for (int sec = 0; sec < newBlock.Length; sec += 512)
-            BinaryPrimitives.WriteUInt16BigEndian(newBlock.AsSpan(sec + 4), 512);
-        
-        // Overwrite first section with actual entry
-        BinaryPrimitives.WriteUInt32BigEndian(newBlock.AsSpan(0), (uint)newInodeNumber);
-        BinaryPrimitives.WriteUInt16BigEndian(newBlock.AsSpan(4), 512); // reclen = DIRBLKSIZ
-        newBlock[6] = entryType;
-        byte[] nameBytes2 = System.Text.Encoding.UTF8.GetBytes(name);
-        newBlock[7] = (byte)nameBytes2.Length;
-        Array.Copy(nameBytes2, 0, newBlock, 8, nameBytes2.Length);
-
-        WriteDataBlock(newAbsFrag, newBlock);
-        MarkFragmentsUsed(blockCgInfo, (int)newFrag, fragsPerBlock);
-        WriteCylinderGroup(blockCgInfo);
-
-        // Update parent inode: add new block pointer and increase size
-        var rawParent = _disk.ReadBytes(
-            _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-            + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-            (int)sb.InodeSize);
-
-        // Write new direct block pointer at di_db[newSlot] (offset 0x70 + slot*8)
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x70 + newSlot * 8), newAbsFrag);
-        // Update di_size: only add DIRBLKSIZ (512), not the full block
-        // Future entries will grow di_size in 512-byte increments within this block
-        long oldSize = BinaryPrimitives.ReadInt64BigEndian(rawParent.AsSpan(0x10));
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x10), oldSize + 512);
-        // Update di_blocks: full block was allocated
-        long oldBlocks = BinaryPrimitives.ReadInt64BigEndian(rawParent.AsSpan(0x18));
-        BinaryPrimitives.WriteInt64BigEndian(rawParent.AsSpan(0x18), oldBlocks + sb.BlockSize / 512);
-        WriteInode(parentInodeNumber, rawParent);
+        GrowDirectory(parentInodeNumber, newInodeNumber, name, entryType, blockCg, blockCgInfo, fragsPerBlock,
+            out expandedRawParent);
         expanded = true;
-        expandedRawParent = rawParent;
+    }
 
-        _log($"  Expanded directory: new block at frag 0x{newAbsFrag:X} (slot {newSlot}), size now {oldSize + 512}");
+    /// <summary>
+    /// Append one 512-byte directory chunk (DIRBLKSIZ) holding the new entry, the way
+    /// FFS does it: the last block only owns enough fragments to cover di_size. When the
+    /// chunk does not fit, the last block grows by one fragment (in place if the next
+    /// fragment is free, otherwise the fragments are copied to a new run), and a new
+    /// block starts as a single fragment. Upstream allocated whole blocks while counting
+    /// di_size in 512-byte steps, which fsck reports as INCORRECT BLOCK COUNT and
+    /// BLK(S) MISSING IN BIT MAPS.
+    /// </summary>
+    private void GrowDirectory(long dirInode, long newInodeNumber, string name, byte entryType,
+        int preferredCg, CylinderGroupInfo preferredCgInfo, int fpb, out byte[]? rawDirOut)
+    {
+        var sb = _fs.Superblock!;
+        int fsize = (int)sb.FragmentSize;
+        int bsize = (int)sb.BlockSize;
+        byte[] nameBytes = ValidateEntryName(name);
+
+        byte[] raw = ReadRawInode(dirInode);
+        long size = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x10));
+        long diBlocks = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x18));
+        if (size <= 0 || size % 512 != 0)
+            throw new InvalidDataException($"Directory inode {dirInode} has an unexpected size ({size}).");
+        if (BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0xD0)) != 0)
+            throw new IOException("Directory uses indirect blocks — growing it is not supported yet.");
+
+        int lastIdx = (int)((size - 1) / bsize);
+        long totalFrags = diBlocks * 512 / fsize;
+        int allocLast = (int)Math.Clamp(totalFrags - (long)lastIdx * fpb, 1, fpb);
+        long lastAddr = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(0x70 + lastIdx * 8));
+
+        long newSize = size + 512;
+        int targetIdx;
+        long targetAddr;
+        int sectionOffset; // byte offset of the new chunk inside the target block
+
+        if (size % bsize == 0)
+        {
+            // Last block is full: start a new block with one fragment.
+            targetIdx = lastIdx + 1;
+            if (targetIdx >= 12)
+                throw new IOException("Directory has 12 direct blocks full — indirect directory blocks not supported yet.");
+            var (cgNum, cgInfo, local) = AllocFragments(preferredCg, preferredCgInfo, 1);
+            targetAddr = (long)cgNum * sb.FragsPerGroup + local;
+            MarkFragmentsUsed(cgInfo, local, 1);
+            WriteCylinderGroup(cgInfo);
+            diBlocks += fsize / 512;
+            sectionOffset = 0;
+            byte[] frag = new byte[fsize];
+            for (int sec = 0; sec < fsize; sec += 512)
+                BinaryPrimitives.WriteUInt16BigEndian(frag.AsSpan(sec + 4), 512);
+            WriteEntryInChunk(frag, 0, newInodeNumber, nameBytes, entryType);
+            QueueWrite(_partitionOffset + targetAddr * fsize, frag, $"New directory block {targetIdx} (add '{name}')");
+            _log($"  Directory grew: new block {targetIdx} at frag 0x{targetAddr:X}");
+        }
+        else
+        {
+            targetIdx = lastIdx;
+            sectionOffset = (int)(size - (long)lastIdx * bsize);
+            int needed = (sectionOffset + 512 + fsize - 1) / fsize;
+            targetAddr = lastAddr;
+
+            if (needed > allocLast)
+            {
+                // Need one more fragment for this block.
+                int cgNum = (int)(lastAddr / sb.FragsPerGroup);
+                int local = (int)(lastAddr % sb.FragsPerGroup);
+                var cgInfo = ReadCylinderGroup(cgNum);
+                int nextLocal = local + allocLast;
+                bool inPlace = needed <= fpb && (nextLocal % fpb) != 0
+                    && IsFragmentFree(cgInfo, nextLocal)
+                    && !_protectedFragments.Contains((long)cgNum * sb.FragsPerGroup + nextLocal);
+                if (inPlace)
+                {
+                    MarkFragmentsUsed(cgInfo, nextLocal, needed - allocLast);
+                    WriteCylinderGroup(cgInfo);
+                    _log($"  Directory block {lastIdx} extended in place to {needed} fragment(s)");
+                }
+                else
+                {
+                    var (newCg, newCgInfo, newLocal) = AllocFragments(cgNum, cgInfo, needed);
+                    long newAddr = (long)newCg * sb.FragsPerGroup + newLocal;
+                    byte[] oldData = _disk.ReadBytes(_partitionOffset + lastAddr * fsize, allocLast * fsize);
+                    byte[] moved = new byte[needed * fsize];
+                    Array.Copy(oldData, moved, oldData.Length);
+                    for (int sec = oldData.Length; sec < moved.Length; sec += 512)
+                        BinaryPrimitives.WriteUInt16BigEndian(moved.AsSpan(sec + 4), 512);
+                    MarkFragmentsUsed(newCgInfo, newLocal, needed);
+                    WriteCylinderGroup(newCgInfo);
+                    QueueWrite(_partitionOffset + newAddr * fsize, moved, $"Relocate directory block {lastIdx} to grow it");
+                    // The old fragments are released after the inode points at the copy.
+                    _pendingDirFree = (lastAddr, allocLast);
+                    targetAddr = newAddr;
+                    BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x70 + lastIdx * 8), newAddr);
+                    _log($"  Directory block {lastIdx} relocated from 0x{lastAddr:X} to 0x{newAddr:X} ({needed} fragments)");
+                }
+                diBlocks += (long)(needed - allocLast) * fsize / 512;
+            }
+
+            // Write the new chunk (a fresh 512-byte section) inside the target block.
+            long chunkOffset = _partitionOffset + targetAddr * fsize + sectionOffset;
+            byte[] chunk = new byte[512];
+            WriteEntryInChunk(chunk, 0, newInodeNumber, nameBytes, entryType);
+            QueueWrite(chunkOffset, chunk, $"Directory chunk at block {targetIdx}+{sectionOffset} (add '{name}')");
+        }
+
+        if (targetIdx != lastIdx)
+            BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x70 + targetIdx * 8), targetAddr);
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x10), newSize);
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x18), diBlocks);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x28), now); // mtime
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x30), now); // ctime
+        if (SafeWriteOrdering) DurabilityBarrier();
+        WriteInode(dirInode, raw);
+
+        if (_pendingDirFree.HasValue)
+        {
+            var (freeAddr, freeCount) = _pendingDirFree.Value;
+            _pendingDirFree = null;
+            FreeFragmentRun(freeAddr, freeCount);
+        }
+        rawDirOut = raw;
+        _log($"  Directory inode {dirInode}: size {size} -> {newSize}, di_blocks {diBlocks}");
+    }
+
+    private (long Addr, int Count)? _pendingDirFree;
+
+    private static void WriteEntryInChunk(byte[] buf, int offset, long inode, byte[] nameBytes, byte entryType)
+    {
+        Array.Clear(buf, offset, 512);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(offset), (uint)inode);
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(offset + 4), 512);
+        buf[offset + 6] = entryType;
+        buf[offset + 7] = (byte)nameBytes.Length;
+        Array.Copy(nameBytes, 0, buf, offset + 8, nameBytes.Length);
+    }
+
+    /// <summary>Find <paramref name="count"/> free fragments inside one block, preferring a CG.</summary>
+    /// <remarks>
+    /// Directory fragments always start on a block boundary. The upstream reference
+    /// notes (bug 15) found the PS3 kernel misreads directories whose block starts
+    /// mid-block, so runs are carved from the start of an entirely free block.
+    /// </remarks>
+    private (int CgNum, CylinderGroupInfo CgInfo, int Local) AllocFragments(int preferredCg, CylinderGroupInfo preferredCgInfo, int count)
+    {
+        var sb = _fs.Superblock!;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        long local = FindFreeFragments(preferredCgInfo, fpb);
+        if (local >= 0) return (preferredCg, preferredCgInfo, (int)local);
+        for (int i = 1; i < sb.CylinderGroups; i++)
+        {
+            int tryCg = (preferredCg + i) % sb.CylinderGroups;
+            var info = ReadCylinderGroup(tryCg);
+            if (info.Magic != 0x00090255) continue;
+            local = FindFreeFragments(info, fpb);
+            if (local >= 0) return (tryCg, info, (int)local);
+        }
+        throw new IOException("No free space left for the directory.");
     }
 
     /// <summary>
@@ -2169,9 +2379,12 @@ public class Ufs2Writer
     /// </summary>
     public void UpdateSuperblock()
     {
-        // Flush all pending data writes and deferred CG writes first
+        // Flush all pending data writes and deferred CG writes first, and make them
+        // stable before the superblock summary that describes them is rewritten.
+        ReleaseBatchReservation();
         FlushDataBatch();
         FlushDirtyCgs();
+        if (!_dryRun) _disk.Flush();
         
         var sb = _fs.Superblock!;
         int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
@@ -2267,6 +2480,7 @@ public class Ufs2Writer
             QueueWrite(csSummaryOffset, csData, $"CS summary ({csSize} bytes)");
             _log($"  CS summary written ({sb.CylinderGroups} entries).");
         }
+        if (!_dryRun) _disk.Flush();
         
         _log($"  Done (delta: dirs={totalNdir - oldNdir}, blocks={totalNbfree - oldNbfree}, inodes={totalNifree - oldNifree}, frags={totalNffree - oldNffree}, clusters={totalNclusters - oldNclusters}).");
     }
@@ -2372,165 +2586,177 @@ public class Ufs2Writer
     }
 
     /// <summary>
-    /// Free all data blocks owned by an inode (direct, indirect, double indirect).
+    /// Fragments occupied by direct block <paramref name="i"/>, using the FFS rule
+    /// (blksize): every block is full except the last direct block of a file with no
+    /// indirect blocks, which holds only enough fragments for the remaining bytes.
+    /// The count is cross-checked against di_blocks and the smaller value wins, so a
+    /// disagreement can leak space but can never free fragments owned by another file.
+    /// Upstream freed a whole block at every tail address, releasing neighbours' data.
     /// </summary>
-    public void FreeInodeBlocks(Ufs2Inode inode)
+    private int DirectBlockFragments(Ufs2Inode inode, int i, int lastDirect, bool hasIndirect, int nonZeroDirect)
     {
         var sb = _fs.Superblock!;
-        int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
-        long allocBytes = inode.Blocks * 512;
-        bool block0IsFragment = (allocBytes > 0 && allocBytes < sb.BlockSize);
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        if (hasIndirect || i != lastDirect) return fpb;
+
+        long bySize = inode.Size >= (long)(i + 1) * sb.BlockSize
+            ? fpb
+            : (inode.Size - (long)i * sb.BlockSize + sb.FragmentSize - 1) / sb.FragmentSize;
+        long totalFrags = inode.Blocks * 512 / sb.FragmentSize;
+        long byBlocks = totalFrags - (long)(nonZeroDirect - 1) * fpb;
+
+        long frags;
+        if (bySize >= 1 && byBlocks >= 1) frags = Math.Min(bySize, byBlocks);
+        else if (byBlocks >= 1) frags = byBlocks;
+        else frags = bySize;
+        if (bySize != byBlocks)
+            _log($"  NOTE inode {inode.InodeNumber}: last block size says {bySize} frag(s), di_blocks says {byBlocks}; freeing {Math.Clamp(frags, 1, fpb)}");
+        return (int)Math.Clamp(frags, 1, fpb);
+    }
+
+    /// <summary>
+    /// List every fragment run owned by an inode (data and indirect blocks, all three
+    /// indirection levels, holes skipped) and check each run is inside the filesystem
+    /// and currently marked in use. Nothing is changed, so a bad inode aborts the
+    /// operation before any bitmap is touched.
+    /// </summary>
+    private List<(long AbsFrag, int Count)> CollectInodeFragments(Ufs2Inode inode)
+    {
+        var sb = _fs.Superblock!;
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        var runs = new List<(long AbsFrag, int Count)>();
+
+        // Inline symlinks and empty files own no blocks; their di_db area may hold text.
+        if (inode.Blocks <= 0) return runs;
+
+        bool hasIndirect = inode.IndirectBlock != 0 || inode.DoubleIndirectBlock != 0 || inode.TripleIndirectBlock != 0;
+        int lastDirect = -1, nonZeroDirect = 0;
+        for (int i = 0; i < 12; i++)
+            if (inode.DirectBlocks[i] != 0) { lastDirect = i; nonZeroDirect++; }
 
         for (int i = 0; i < 12; i++)
         {
             long frag = inode.DirectBlocks[i];
-            if (frag == 0) break;
-            int cgNum = (int)(frag / sb.FragsPerGroup);
-            int localFrag = (int)(frag % sb.FragsPerGroup);
-            var cg = ReadCylinderGroup(cgNum);
-            if (i == 0 && block0IsFragment)
-                MarkFragmentFree(cg, localFrag);
-            else
-                MarkFragmentsFree(cg, localFrag, fragsPerBlock);
-            WriteCylinderGroup(cg);
+            if (frag == 0) continue; // hole
+            runs.Add((frag, DirectBlockFragments(inode, i, lastDirect, hasIndirect, nonZeroDirect)));
         }
 
-        if (inode.IndirectBlock != 0)
+        void Walk(long addr, int level)
         {
-            byte[] indBlock = _disk.ReadBytes(
-                _partitionOffset + inode.IndirectBlock * sb.FragmentSize, (int)sb.BlockSize);
-            for (int p = 0; p < (int)sb.BlockSize / 8; p++)
+            if (addr == 0) return;
+            CheckFragmentAddress(addr, fpb, $"Indirect block (level {level}) of inode {inode.InodeNumber}");
+            byte[] blk = _disk.ReadBytes(_partitionOffset + addr * sb.FragmentSize, (int)sb.BlockSize);
+            for (int p = 0; p < blk.Length / 8; p++)
             {
-                long ptr = BinaryPrimitives.ReadInt64BigEndian(indBlock.AsSpan(p * 8));
-                if (ptr == 0) break;
-                int cgNum = (int)(ptr / sb.FragsPerGroup);
-                int localFrag = (int)(ptr % sb.FragsPerGroup);
-                var cg = ReadCylinderGroup(cgNum);
-                MarkFragmentsFree(cg, localFrag, fragsPerBlock);
-                WriteCylinderGroup(cg);
+                long ptr = BinaryPrimitives.ReadInt64BigEndian(blk.AsSpan(p * 8));
+                if (ptr == 0) continue; // hole
+                if (level == 1) runs.Add((ptr, fpb));
+                else Walk(ptr, level - 1);
             }
-            int indCg = (int)(inode.IndirectBlock / sb.FragsPerGroup);
-            int indLocal = (int)(inode.IndirectBlock % sb.FragsPerGroup);
-            var indCgInfo = ReadCylinderGroup(indCg);
-            MarkFragmentsFree(indCgInfo, indLocal, fragsPerBlock);
-            WriteCylinderGroup(indCgInfo);
+            runs.Add((addr, fpb));
         }
+        Walk(inode.IndirectBlock, 1);
+        Walk(inode.DoubleIndirectBlock, 2);
+        Walk(inode.TripleIndirectBlock, 3);
 
-        if (inode.DoubleIndirectBlock != 0)
+        var seen = new HashSet<long>();
+        var result = new List<(long AbsFrag, int Count)>();
+        int alreadyFree = 0;
+        foreach (var (absFrag, count) in runs)
         {
-            byte[] dblBlock = _disk.ReadBytes(
-                _partitionOffset + inode.DoubleIndirectBlock * sb.FragmentSize, (int)sb.BlockSize);
-            for (int l1 = 0; l1 < (int)sb.BlockSize / 8; l1++)
+            CheckFragmentAddress(absFrag, count, $"Block pointer of inode {inode.InodeNumber}");
+            var cg = ReadCylinderGroup((int)(absFrag / sb.FragsPerGroup));
+            int local = (int)(absFrag % sb.FragsPerGroup);
+            long runStart = -1;
+            int runLen = 0;
+            for (int f = 0; f < count; f++)
             {
-                long l1Ptr = BinaryPrimitives.ReadInt64BigEndian(dblBlock.AsSpan(l1 * 8));
-                if (l1Ptr == 0) break;
-                byte[] l1Block = _disk.ReadBytes(
-                    _partitionOffset + l1Ptr * sb.FragmentSize, (int)sb.BlockSize);
-                for (int p = 0; p < (int)sb.BlockSize / 8; p++)
+                if (!seen.Add(absFrag + f))
+                    throw new InvalidDataException($"Inode {inode.InodeNumber} references fragment 0x{absFrag + f:X} twice; refusing to free it.");
+                if (IsFragmentFree(cg, local + f))
                 {
-                    long ptr = BinaryPrimitives.ReadInt64BigEndian(l1Block.AsSpan(p * 8));
-                    if (ptr == 0) break;
-                    int cgNum = (int)(ptr / sb.FragsPerGroup);
-                    int localFrag = (int)(ptr % sb.FragsPerGroup);
-                    var cg = ReadCylinderGroup(cgNum);
-                    MarkFragmentsFree(cg, localFrag, fragsPerBlock);
-                    WriteCylinderGroup(cg);
+                    // Already free (seen on some native PS3 directories): nothing to release,
+                    // and releasing it again would corrupt the free counts.
+                    alreadyFree++;
+                    if (runLen > 0) { result.Add((runStart, runLen)); runLen = 0; }
+                    continue;
                 }
-                int l1Cg = (int)(l1Ptr / sb.FragsPerGroup);
-                int l1Local = (int)(l1Ptr % sb.FragsPerGroup);
-                var l1CgInfo = ReadCylinderGroup(l1Cg);
-                MarkFragmentsFree(l1CgInfo, l1Local, fragsPerBlock);
-                WriteCylinderGroup(l1CgInfo);
+                if (runLen == 0) runStart = absFrag + f;
+                runLen++;
             }
-            int dblCg = (int)(inode.DoubleIndirectBlock / sb.FragsPerGroup);
-            int dblLocal = (int)(inode.DoubleIndirectBlock % sb.FragsPerGroup);
-            var dblCgInfo = ReadCylinderGroup(dblCg);
-            MarkFragmentsFree(dblCgInfo, dblLocal, fragsPerBlock);
-            WriteCylinderGroup(dblCgInfo);
+            if (runLen > 0) result.Add((runStart, runLen));
         }
+        if (alreadyFree > 0)
+            _log($"  NOTE inode {inode.InodeNumber}: {alreadyFree} fragment(s) were already marked free; skipped");
+        return result;
+    }
+
+    /// <summary>
+    /// Free all data blocks owned by an inode (direct, single, double and triple indirect).
+    /// </summary>
+    public void FreeInodeBlocks(Ufs2Inode inode)
+    {
+        foreach (var (absFrag, count) in CollectInodeFragments(inode))
+            FreeFragmentRun(absFrag, count);
     }
 
     /// <summary>
     /// Remove a directory entry by name from a parent directory.
     /// Merges the entry's reclen into the previous entry, or zeros it if first in section.
+    /// When <paramref name="expectedInode"/> is given, the entry must point at that inode.
+    /// Returns the inode number the entry pointed at.
     /// </summary>
-    public void RemoveDirectoryEntry(long parentInodeNumber, string name)
+    public long RemoveDirectoryEntry(long parentInodeNumber, string name, long expectedInode = -1)
     {
-        var sb = _fs.Superblock!;
-        var parentInode = _fs.ReadInode(parentInodeNumber);
-        long dirSize = parentInode.Size;
-        long bytesLeft = dirSize;
-        long allocBytes = parentInode.Blocks * 512;
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+        var loc = LocateEntry(parentInodeNumber, nameBytes)
+            ?? throw new IOException($"Entry '{name}' not found in directory (inode {parentInodeNumber})");
+        if (expectedInode >= 0 && loc.Inode != expectedInode)
+            throw new IOException($"Entry '{name}' points at inode {loc.Inode}, expected {expectedInode}; refusing to remove it.");
 
-        for (int i = 0; i < 12; i++)
+        byte[] dirBlock = loc.Block;
+        int offset = loc.Offset;
+        ushort recLen = BinaryPrimitives.ReadUInt16BigEndian(dirBlock.AsSpan(offset + 4));
+        if (loc.PrevOffset >= 0)
         {
-            long blockAddr = parentInode.DirectBlocks[i];
-            if (blockAddr == 0) break;
-            if (bytesLeft <= 0) break;
-
-            int blockCapacity = (i == 0 && allocBytes < sb.BlockSize) 
-                ? (int)sb.FragmentSize : (int)sb.BlockSize;
-            int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
-            long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-            byte[] dirBlock = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
-
-            int numSections = thisBlockSize / 512;
-            for (int section = 0; section < numSections; section++)
-            {
-                int sectionStart = section * 512;
-                int sectionEnd = sectionStart + 512;
-                int offset = sectionStart;
-                int prevOffset = -1;
-
-                while (offset < sectionEnd)
-                {
-                    uint ino = BinaryPrimitives.ReadUInt32BigEndian(dirBlock.AsSpan(offset));
-                    ushort recLen = BinaryPrimitives.ReadUInt16BigEndian(dirBlock.AsSpan(offset + 4));
-                    if (recLen == 0) break;
-
-                    if (ino != 0)
-                    {
-                        byte nameLen = dirBlock[offset + 7];
-                        string entryName = System.Text.Encoding.ASCII.GetString(
-                            dirBlock, offset + 8, Math.Min(nameLen, sectionEnd - offset - 8));
-
-                        if (entryName == name)
-                        {
-                            if (prevOffset >= 0)
-                            {
-                                // Merge into previous entry
-                                ushort prevRecLen = BinaryPrimitives.ReadUInt16BigEndian(dirBlock.AsSpan(prevOffset + 4));
-                                BinaryPrimitives.WriteUInt16BigEndian(dirBlock.AsSpan(prevOffset + 4), (ushort)(prevRecLen + recLen));
-                                Array.Clear(dirBlock, offset, recLen);
-                            }
-                            else
-                            {
-                                // First in section — zero inode, keep reclen for chain
-                                BinaryPrimitives.WriteUInt32BigEndian(dirBlock.AsSpan(offset), 0);
-                                dirBlock[offset + 6] = 0;
-                                dirBlock[offset + 7] = 0;
-                                // Clear name area
-                                for (int c = offset + 8; c < offset + recLen && c < sectionEnd; c++)
-                                    dirBlock[c] = 0;
-                            }
-
-                            QueueWrite(blockDiskOffset, dirBlock, $"Remove entry '{name}' from dir block {i}");
-                            return;
-                        }
-                    }
-
-                    prevOffset = (ino != 0) ? offset : prevOffset;
-                    offset += recLen;
-                }
-            }
-            bytesLeft -= thisBlockSize;
+            // Merge into previous entry
+            ushort prevRecLen = BinaryPrimitives.ReadUInt16BigEndian(dirBlock.AsSpan(loc.PrevOffset + 4));
+            BinaryPrimitives.WriteUInt16BigEndian(dirBlock.AsSpan(loc.PrevOffset + 4), (ushort)(prevRecLen + recLen));
+            Array.Clear(dirBlock, offset, recLen);
+        }
+        else
+        {
+            // First in section — zero inode, keep reclen for chain
+            BinaryPrimitives.WriteUInt32BigEndian(dirBlock.AsSpan(offset), 0);
+            dirBlock[offset + 6] = 0;
+            dirBlock[offset + 7] = 0;
+            Array.Clear(dirBlock, offset + 8, recLen - 8);
         }
 
-        throw new IOException($"Entry '{name}' not found in directory (inode {parentInodeNumber})");
+        QueueWrite(loc.BlockDiskOffset, dirBlock, $"Remove entry '{name}' from dir block {loc.BlockIndex}");
+        return loc.Inode;
+    }
+
+    private void ChangeLinkCount(long inodeNumber, int delta)
+    {
+        byte[] raw = ReadRawInode(inodeNumber);
+        short nlink = BinaryPrimitives.ReadInt16BigEndian(raw.AsSpan(0x02));
+        int updated = nlink + delta;
+        if (updated > short.MaxValue)
+            throw new InvalidDataException($"Link count of inode {inodeNumber} would overflow.");
+        if (updated < 1)
+        {
+            // Never write 0 for a live inode; fsck can correct a count that is too high.
+            _log($"  NOTE inode {inodeNumber}: link count {nlink}{delta:+#;-#;0} clamped to 1");
+            updated = 1;
+        }
+        BinaryPrimitives.WriteInt16BigEndian(raw.AsSpan(0x02), (short)updated);
+        BinaryPrimitives.WriteInt64BigEndian(raw.AsSpan(0x30), DateTimeOffset.UtcNow.ToUnixTimeSeconds()); // ctime
+        WriteInode(inodeNumber, raw);
     }
 
     /// <summary>
-    /// Delete a file: free blocks, free inode, remove directory entry.
+    /// Delete a file: remove the directory entry, then release the inode and its blocks.
     /// </summary>
     public void DeleteFile(long parentInodeNumber, string name, long fileInodeNumber)
     {
@@ -2538,18 +2764,33 @@ public class Ufs2Writer
         _log($"[DELETE] Deleting file '{name}' (inode {fileInodeNumber}) from parent {parentInodeNumber}");
 
         var inode = _fs.ReadInode(fileInodeNumber);
-        FreeInodeBlocks(inode);
+        if (inode.FileType == Ufs2FileType.Directory)
+            throw new IOException($"'{name}' is a directory; use DeleteDirectory.");
 
+        // Validate everything we are about to free before changing anything.
+        var runs = inode.LinkCount > 1 ? new List<(long AbsFrag, int Count)>() : CollectInodeFragments(inode);
+
+        // 1. Unlink first: a crash afterwards leaks space instead of leaving a name
+        //    that points at a released inode.
+        RemoveDirectoryEntry(parentInodeNumber, name, fileInodeNumber);
+        if (SafeWriteOrdering) DurabilityBarrier();
+
+        if (inode.LinkCount > 1)
+        {
+            // Other names still reference this inode: just drop one link.
+            ChangeLinkCount(fileInodeNumber, -1);
+            _log($"  Removed one of {inode.LinkCount} links to inode {fileInodeNumber}");
+            return;
+        }
+
+        // 2. Release the inode and its blocks.
+        WriteInode(fileInodeNumber, new byte[(int)sb.InodeSize]);
+        foreach (var (absFrag, count) in runs)
+            FreeFragmentRun(absFrag, count);
         int cgNum = (int)(fileInodeNumber / sb.InodesPerGroup);
-        int inodeIdx = (int)(fileInodeNumber % sb.InodesPerGroup);
         var cg = ReadCylinderGroup(cgNum);
-        MarkInodeFree(cg, inodeIdx);
+        MarkInodeFree(cg, (int)(fileInodeNumber % sb.InodesPerGroup));
         WriteCylinderGroup(cg);
-
-        byte[] zeroInode = new byte[(int)sb.InodeSize];
-        WriteInode(fileInodeNumber, zeroInode);
-
-        RemoveDirectoryEntry(parentInodeNumber, name);
         _log($"  File '{name}' deleted");
     }
 
@@ -2560,8 +2801,11 @@ public class Ufs2Writer
     {
         var sb = _fs.Superblock!;
         _log($"[DELETE] Deleting directory '{name}' (inode {dirInodeNumber}) from parent {parentInodeNumber}");
+        if (dirInodeNumber == 2) throw new IOException("Refusing to delete the root directory.");
 
         var inode = _fs.ReadInode(dirInodeNumber);
+        if (inode.FileType != Ufs2FileType.Directory)
+            throw new IOException($"'{name}' is not a directory.");
         var entries = _fs.ReadDirectory(inode);
 
         // Recursively delete children
@@ -2569,99 +2813,127 @@ public class Ufs2Writer
         {
             if (entry.Name == "." || entry.Name == "..") continue;
             var childInode = _fs.ReadInode(entry.InodeNumber);
-            if ((childInode.Mode & 0xF000) == 0x4000)
+            if (childInode.FileType == Ufs2FileType.Directory)
                 DeleteDirectory(dirInodeNumber, entry.Name, entry.InodeNumber);
             else
                 DeleteFile(dirInodeNumber, entry.Name, entry.InodeNumber);
         }
 
-        // Free directory's own blocks and inode
-        FreeInodeBlocks(inode);
+        // Re-read: deleting children may have rewritten this directory's inode.
+        inode = _fs.ReadInode(dirInodeNumber);
+        var runs = CollectInodeFragments(inode);
 
+        // 1. Unlink from the parent and drop the parent's link from our "..".
+        RemoveDirectoryEntry(parentInodeNumber, name, dirInodeNumber);
+        ChangeLinkCount(parentInodeNumber, -1);
+        if (SafeWriteOrdering) DurabilityBarrier();
+
+        // 2. Release the directory's inode and blocks.
+        WriteInode(dirInodeNumber, new byte[(int)sb.InodeSize]);
+        foreach (var (absFrag, count) in runs)
+            FreeFragmentRun(absFrag, count);
         int cgNum = (int)(dirInodeNumber / sb.InodesPerGroup);
-        int inodeIdx = (int)(dirInodeNumber % sb.InodesPerGroup);
         var cg = ReadCylinderGroup(cgNum);
-        MarkInodeFree(cg, inodeIdx);
+        MarkInodeFree(cg, (int)(dirInodeNumber % sb.InodesPerGroup));
         int ndir = BinaryPrimitives.ReadInt32BigEndian(cg.RawData.AsSpan(0x18));
-        BinaryPrimitives.WriteInt32BigEndian(cg.RawData.AsSpan(0x18), ndir - 1);
+        if (ndir > 0) BinaryPrimitives.WriteInt32BigEndian(cg.RawData.AsSpan(0x18), ndir - 1);
         WriteCylinderGroup(cg);
-
-        byte[] zeroInode = new byte[(int)sb.InodeSize];
-        WriteInode(dirInodeNumber, zeroInode);
-
-        RemoveDirectoryEntry(parentInodeNumber, name);
-
-        // Decrement parent nlink (removing ".." reference)
-        var rawParent = _disk.ReadBytes(
-            _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-            + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
-            (int)sb.InodeSize);
-        short nlink = BinaryPrimitives.ReadInt16BigEndian(rawParent.AsSpan(0x02));
-        if (nlink > 1)
-            BinaryPrimitives.WriteInt16BigEndian(rawParent.AsSpan(0x02), (short)(nlink - 1));
-        WriteInode(parentInodeNumber, rawParent);
 
         _log($"  Directory '{name}' deleted ({entries.Count - 2} children removed)");
     }
 
     /// <summary>
-    /// Move a file or directory from one parent to another.
-    /// No data is copied — only directory entries and ".." pointer are updated.
+    /// Rename an entry inside one directory. The new name is linked before the old one
+    /// is removed, so an interruption leaves two names for the file, never zero.
     /// </summary>
-    public void MoveEntry(long srcParentInode, long destParentInode, string name, long entryInode, bool isDirectory)
+    public void RenameEntry(long parentInodeNumber, string oldName, string newName)
     {
         var sb = _fs.Superblock!;
         int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
-        _log($"[MOVE] Moving '{name}' (inode {entryInode}) from {srcParentInode} to {destParentInode}");
+        ValidateEntryName(newName);
+        if (oldName == newName) return;
+        _log($"[RENAME] '{oldName}' -> '{newName}' in inode {parentInodeNumber}");
 
-        if (DirectoryContainsEntry(destParentInode, name))
-            throw new IOException($"Destination directory already contains '{name}'");
+        var loc = LocateEntry(parentInodeNumber, System.Text.Encoding.UTF8.GetBytes(oldName))
+            ?? throw new IOException($"Entry '{oldName}' not found.");
+        if (DirectoryContainsEntry(parentInodeNumber, newName))
+            throw new IOException($"An entry named '{newName}' already exists.");
 
-        // Add entry to destination
-        byte entryType = isDirectory ? (byte)4 : (byte)8;
+        int parentCg = (int)(parentInodeNumber / sb.InodesPerGroup);
+        var cgInfo = ReadCylinderGroup(parentCg);
+        AddEntryToDirectory(parentInodeNumber, _fs.ReadInode(parentInodeNumber), loc.Inode, newName, loc.Type,
+            parentCg, cgInfo, parentCg, cgInfo, fragsPerBlock, out _, out _);
+        if (SafeWriteOrdering) DurabilityBarrier();
+        RemoveDirectoryEntry(parentInodeNumber, oldName, loc.Inode);
+        _log($"  Renamed '{oldName}' to '{newName}'");
+    }
+
+    /// <summary>
+    /// Move a file or directory from one parent to another (optionally renaming it).
+    /// No data is copied — only directory entries, ".." and link counts change.
+    /// </summary>
+    public void MoveEntry(long srcParentInode, long destParentInode, string name, long entryInode, bool isDirectory)
+        => MoveEntry(srcParentInode, destParentInode, name, name, entryInode);
+
+    public void MoveEntry(long srcParentInode, long destParentInode, string name, string newName, long entryInode)
+    {
+        var sb = _fs.Superblock!;
+        int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
+        ValidateEntryName(newName);
+        _log($"[MOVE] Moving '{name}' (inode {entryInode}) from {srcParentInode} to {destParentInode} as '{newName}'");
+
+        if (srcParentInode == destParentInode)
+        {
+            RenameEntry(srcParentInode, name, newName);
+            return;
+        }
+
+        var loc = LocateEntry(srcParentInode, System.Text.Encoding.UTF8.GetBytes(name))
+            ?? throw new IOException($"Entry '{name}' not found in the source directory.");
+        if (loc.Inode != entryInode)
+            throw new IOException($"Entry '{name}' points at inode {loc.Inode}, expected {entryInode}.");
+        if (_fs.ReadInode(destParentInode).FileType != Ufs2FileType.Directory)
+            throw new IOException("Destination is not a directory.");
+        if (DirectoryContainsEntry(destParentInode, newName))
+            throw new IOException($"Destination directory already contains '{newName}'");
+
+        bool isDirectory = _fs.ReadInode(entryInode).FileType == Ufs2FileType.Directory;
+        if (isDirectory)
+        {
+            // Refuse to move a directory into itself or one of its descendants.
+            long walk = destParentInode;
+            for (int depth = 0; depth < 4096; depth++)
+            {
+                if (walk == entryInode)
+                    throw new IOException("Cannot move a folder inside itself.");
+                if (walk == 2) break;
+                long up = ReadParentOf(walk);
+                if (up == walk) break;
+                walk = up;
+            }
+        }
+
+        // 1. Link into the destination first.
         var destInodeData = _fs.ReadInode(destParentInode);
         int destCg = (int)(destParentInode / sb.InodesPerGroup);
         var destCgInfo = ReadCylinderGroup(destCg);
-        AddEntryToDirectory(destParentInode, destInodeData, entryInode, name, entryType,
+        AddEntryToDirectory(destParentInode, destInodeData, entryInode, newName, loc.Type,
             destCg, destCgInfo, destCg, destCgInfo, fragsPerBlock, out _, out _);
+        if (isDirectory) ChangeLinkCount(destParentInode, +1);
+        if (SafeWriteOrdering) DurabilityBarrier();
 
-        // Remove entry from source
-        RemoveDirectoryEntry(srcParentInode, name);
-
+        // 2. Point ".." at the new parent.
         if (isDirectory)
         {
-            // Update ".." in moved directory to point to new parent
-            var movedInode = _fs.ReadInode(entryInode);
-            long block0Addr = movedInode.DirectBlocks[0];
-            if (block0Addr != 0)
-            {
-                long allocBytes = movedInode.Blocks * 512;
-                int readSize = (allocBytes < sb.BlockSize) ? (int)sb.FragmentSize : (int)sb.BlockSize;
-                long blockDiskOffset = _partitionOffset + block0Addr * sb.FragmentSize;
-                byte[] dirBlock = _disk.ReadBytes(blockDiskOffset, readSize);
-                // ".." is the second entry at offset 12
-                BinaryPrimitives.WriteUInt32BigEndian(dirBlock.AsSpan(12), (uint)destParentInode);
-                QueueWrite(blockDiskOffset, dirBlock, $"Update '..' in moved dir to {destParentInode}");
-            }
-
-            // Adjust nlink: decrement source parent, increment dest parent
-            var rawSrc = _disk.ReadBytes(
-                _partitionOffset + (srcParentInode / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                + sb.InodeBlockOffset * sb.FragmentSize + (srcParentInode % sb.InodesPerGroup) * sb.InodeSize,
-                (int)sb.InodeSize);
-            short srcNlink = BinaryPrimitives.ReadInt16BigEndian(rawSrc.AsSpan(0x02));
-            if (srcNlink > 1)
-                BinaryPrimitives.WriteInt16BigEndian(rawSrc.AsSpan(0x02), (short)(srcNlink - 1));
-            WriteInode(srcParentInode, rawSrc);
-
-            var rawDest = _disk.ReadBytes(
-                _partitionOffset + (destParentInode / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
-                + sb.InodeBlockOffset * sb.FragmentSize + (destParentInode % sb.InodesPerGroup) * sb.InodeSize,
-                (int)sb.InodeSize);
-            short destNlink = BinaryPrimitives.ReadInt16BigEndian(rawDest.AsSpan(0x02));
-            BinaryPrimitives.WriteInt16BigEndian(rawDest.AsSpan(0x02), (short)(destNlink + 1));
-            WriteInode(destParentInode, rawDest);
+            var dotdot = LocateEntry(entryInode, new[] { (byte)'.', (byte)'.' })
+                ?? throw new InvalidDataException($"Directory inode {entryInode} has no '..' entry.");
+            BinaryPrimitives.WriteUInt32BigEndian(dotdot.Block.AsSpan(dotdot.Offset), (uint)destParentInode);
+            QueueWrite(dotdot.BlockDiskOffset, dotdot.Block, $"Update '..' in moved dir to {destParentInode}");
         }
+
+        // 3. Unlink from the source.
+        RemoveDirectoryEntry(srcParentInode, name, entryInode);
+        if (isDirectory) ChangeLinkCount(srcParentInode, -1);
 
         _log($"  '{name}' moved successfully");
     }

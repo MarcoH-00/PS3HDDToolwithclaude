@@ -135,6 +135,8 @@ public sealed class DecryptedDiskSourceCbc : IDiskSource, IPipelinedDiskSource
         }
     }
 
+    public void Flush() => _source.Flush();
+
     public unsafe void Dispose()
     {
         _cipher.Dispose();
