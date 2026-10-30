@@ -69,39 +69,25 @@ jobs:
           cp --sparse=always work/base.img work/test.img
           dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- work/test.img work/snapshots
 
-      # The VM only receives the workspace when it starts, so ship the (sparse,
-      # compressed) snapshots over the VM's ssh connection explicitly.
-      - name: Copy snapshots into the VM
+      # The VM only receives the workspace when it starts, so each snapshot is streamed
+      # over the VM's ssh connection (sparse-aware tar), checked, then deleted, one at a
+      # time to stay within the VM's disk space.
+      - name: fsck_ffs every snapshot (inside NetBSD)
         run: |
-          tar -cSzf work/snaps.tgz -C work snapshots
-          echo "::notice title=Snapshot archive::$(ls -la work/snaps.tgz)"
-          echo "::notice title=ssh config::$(cat ~/.ssh/config 2>&1 | tr '\n' '|' | cut -c1-800)"
-          scp -o StrictHostKeyChecking=no work/snaps.tgz netbsd:/tmp/snaps.tgz 2> scp.err || {
-            echo "::error title=scp to VM failed::$(tr '\n' '|' < scp.err | cut -c1-800)"
-            exit 1
-          }
-
-      - name: fsck_ffs every snapshot
-        shell: netbsd {0}
-        run: |
-          rm -rf /tmp/s && mkdir -p /tmp/s && cd /tmp/s || exit 1
-          if ! tar -xzf /tmp/snaps.tgz 2> /tmp/tar.err; then
-            echo "::error title=untar in VM failed::$(tr '\n' '|' < /tmp/tar.err | cut -c1-800)"
-            exit 1
-          fi
-          echo "::notice title=Snapshots in VM::$(ls -ls /tmp/s/snapshots 2>&1 | tr '\n' '|' | cut -c1-1500)"
-          set -- /tmp/s/snapshots/*.img
-          if [ ! -f "$1" ]; then
-            echo "::error title=fsck step::no snapshot images are visible inside the VM"
-            exit 1
-          fi
+          ssh netbsd 'rm -rf /var/tmp/fsck && mkdir -p /var/tmp/fsck && df -h /var/tmp' > df.txt 2>&1 || true
+          echo "::notice title=VM disk::$(tr '\n' '|' < df.txt)"
           status=0
-          for img in "$@"; do
+          for img in work/snapshots/*.img; do
             name=$(basename "$img")
-            echo "== fsck_ffs -n -f $img"
-            out=$(fsck_ffs -n -f "$img" 2>&1); rc=$?
-            echo "$out"
-            if [ $rc -ne 0 ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
+            if ! tar -cSf - -C work/snapshots "$name" | gzip -1 | ssh netbsd 'cd /var/tmp/fsck && gunzip | tar -xf -' 2> copy.err; then
+              echo "::error title=copy $name to VM failed::$(tr '\n' '|' < copy.err | cut -c1-800)"
+              status=1; continue
+            fi
+            ssh netbsd "fsck_ffs -n -f /var/tmp/fsck/$name; echo EXIT=\$?; rm -f /var/tmp/fsck/$name" > fsck.out 2>&1
+            cat fsck.out
+            rc=$(sed -n 's/^EXIT=//p' fsck.out | tail -n 1)
+            out=$(grep -v '^EXIT=' fsck.out)
+            if [ "${rc:-1}" != "0" ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
               bad=1
             else
               bad=0
@@ -113,12 +99,12 @@ jobs:
                 if [ $bad -eq 1 ]; then
                   echo "::notice title=fsck control ($name)::detected the planted corruption as expected: $summary"
                 else
-                  echo "::error title=fsck control ($name)::fsck did NOT detect the planted corruption — the oracle is not working: $summary"
+                  echo "::error title=fsck control ($name)::fsck did NOT detect the planted corruption, so the check is not working: $summary"
                   status=1
                 fi ;;
               *)
                 if [ $bad -eq 1 ]; then
-                  echo "::error title=fsck_ffs found problems in $name (exit $rc)::$summary"
+                  echo "::error title=fsck_ffs found problems in $name (exit ${rc:-?})::$summary"
                   status=1
                 else
                   echo "::notice title=fsck clean ($name)::$summary"
