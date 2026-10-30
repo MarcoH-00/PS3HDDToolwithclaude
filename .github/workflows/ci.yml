@@ -74,13 +74,21 @@ jobs:
       - name: Copy snapshots into the VM
         run: |
           tar -cSzf work/snaps.tgz -C work snapshots
-          ls -la work/snaps.tgz
-          scp -o StrictHostKeyChecking=no work/snaps.tgz netbsd:/tmp/snaps.tgz
+          echo "::notice title=Snapshot archive::$(ls -la work/snaps.tgz)"
+          echo "::notice title=ssh config::$(cat ~/.ssh/config 2>&1 | tr '\n' '|' | cut -c1-800)"
+          scp -o StrictHostKeyChecking=no work/snaps.tgz netbsd:/tmp/snaps.tgz 2> scp.err || {
+            echo "::error title=scp to VM failed::$(tr '\n' '|' < scp.err | cut -c1-800)"
+            exit 1
+          }
 
       - name: fsck_ffs every snapshot
         shell: netbsd {0}
         run: |
-          rm -rf /tmp/s && mkdir -p /tmp/s && cd /tmp/s && tar -xzf /tmp/snaps.tgz || exit 1
+          rm -rf /tmp/s && mkdir -p /tmp/s && cd /tmp/s || exit 1
+          if ! tar -xzf /tmp/snaps.tgz 2> /tmp/tar.err; then
+            echo "::error title=untar in VM failed::$(tr '\n' '|' < /tmp/tar.err | cut -c1-800)"
+            exit 1
+          fi
           echo "::notice title=Snapshots in VM::$(ls -ls /tmp/s/snapshots 2>&1 | tr '\n' '|' | cut -c1-1500)"
           set -- /tmp/s/snapshots/*.img
           if [ ! -f "$1" ]; then
