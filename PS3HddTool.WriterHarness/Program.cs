@@ -28,6 +28,7 @@ internal static class Program
 
         try
         {
+            Phase("superblock probe", ProbeSuperblock);
             Phase("baseline mount", () => WithFs(fs => Log($"ncg={fs.Superblock!.CylinderGroups} ipg={fs.Superblock.InodesPerGroup} bsize={fs.Superblock.BlockSize} fsize={fs.Superblock.FragmentSize}")));
 
             Phase("create directories", () =>
@@ -252,6 +253,21 @@ internal static class Program
     });
 
     // ── helpers ─────────────────────────────────────────────────────────────────
+
+    private static void ProbeSuperblock()
+    {
+        using var f = File.OpenRead(_image);
+        Log($"image size {f.Length} bytes");
+        foreach (long sbOff in new long[] { 0, 8192, 65536, 262144 })
+        {
+            var buf = new byte[0x560];
+            f.Position = sbOff;
+            f.ReadExactly(buf);
+            uint be = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(0x55C));
+            uint le = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(0x55C));
+            Log($"offset {sbOff}: magic BE=0x{be:X8} LE=0x{le:X8} bsize(BE)={System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(buf.AsSpan(0x30))}");
+        }
+    }
 
     private static string ParentPath(string path)
     {

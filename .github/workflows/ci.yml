@@ -59,6 +59,8 @@ jobs:
             mkdir -p work/seed
             echo "seed" > work/seed/readme.txt
             makefs -t ffs -B be -s 256m -o version=2,bsize=16384,fsize=4096,density=1048576 work/base.img work/seed
+            echo "== dumpfs"
+            dumpfs -s work/base.img | head -40 || true
             echo "== baseline fsck"
             fsck_ffs -n -f work/base.img
 
