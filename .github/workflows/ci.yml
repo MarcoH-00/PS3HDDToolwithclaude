@@ -74,8 +74,15 @@ jobs:
       - name: fsck_ffs every snapshot
         shell: netbsd {0}
         run: |
+          cd "$GITHUB_WORKSPACE" || exit 1
+          echo "::notice title=VM view of workspace::pwd=$(pwd) | $(ls -la work work/snapshots 2>&1 | tr '\n' '|' | cut -c1-1500)"
+          set -- work/snapshots/*.img
+          if [ ! -f "$1" ]; then
+            echo "::error title=fsck step::no snapshot images are visible inside the VM"
+            exit 1
+          fi
           status=0
-          for img in work/snapshots/*.img; do
+          for img in "$@"; do
             name=$(basename "$img")
             echo "== fsck_ffs -n -f $img"
             out=$(fsck_ffs -n -f "$img" 2>&1); rc=$?
