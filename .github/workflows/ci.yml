@@ -50,13 +50,11 @@ jobs:
       # A big-endian FFSv2 (UFS2) image with PS3-like geometry: superblock at 64 KiB,
       # 16 KiB blocks, 4 KiB fragments. 2 GiB (sparse) gives several cylinder groups,
       # and -i keeps inodes per group low so the harness can exhaust one (issue #7).
-      # sshfs shares the workspace live, so the sparse images are never copied.
       - name: Create image in NetBSD
         id: vm
         uses: vmactions/netbsd-vm@v1
         with:
           usesh: true
-          sync: sshfs
           run: |
             set -e
             mkdir -p work
@@ -71,12 +69,20 @@ jobs:
           cp --sparse=always work/base.img work/test.img
           dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- work/test.img work/snapshots
 
+      # The VM only receives the workspace when it starts, so ship the (sparse,
+      # compressed) snapshots over the VM's ssh connection explicitly.
+      - name: Copy snapshots into the VM
+        run: |
+          tar -cSzf work/snaps.tgz -C work snapshots
+          ls -la work/snaps.tgz
+          scp -o StrictHostKeyChecking=no work/snaps.tgz netbsd:/tmp/snaps.tgz
+
       - name: fsck_ffs every snapshot
         shell: netbsd {0}
         run: |
-          cd "$GITHUB_WORKSPACE" || exit 1
-          echo "::notice title=VM view of workspace::pwd=$(pwd) | $(ls -la work work/snapshots 2>&1 | tr '\n' '|' | cut -c1-1500)"
-          set -- work/snapshots/*.img
+          rm -rf /tmp/s && mkdir -p /tmp/s && cd /tmp/s && tar -xzf /tmp/snaps.tgz || exit 1
+          echo "::notice title=Snapshots in VM::$(ls -ls /tmp/s/snapshots 2>&1 | tr '\n' '|' | cut -c1-1500)"
+          set -- /tmp/s/snapshots/*.img
           if [ ! -f "$1" ]; then
             echo "::error title=fsck step::no snapshot images are visible inside the VM"
             exit 1
