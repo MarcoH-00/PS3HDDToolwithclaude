@@ -135,8 +135,27 @@ public partial class MainViewModel : ObservableObject
             StatusText = $"Opening {Path.GetFileName(filePath)}...";
             var opened = await Task.Run(() =>
             {
-                var source = new ImageDiskSource(filePath);
-                try { return (Source: source, Layout: Ps4DiskLayout.TryRead(source)); }
+                // Detect PS4 read-only first, exactly like physical drives. PS3 images are
+                // then reopened read-write so edits can be rehearsed on a copy of a drive
+                // before touching real hardware; "Fake writes" still gates every write.
+                IDiskSource source = new ImageDiskSource(filePath);
+                try
+                {
+                    var layout = Ps4DiskLayout.TryRead(source);
+                    if (layout == null)
+                    {
+                        // Close the probe handle first: Windows refuses a write handle
+                        // while another handle only shares reading.
+                        source.Dispose();
+                        try { source = new ImageDiskSource(filePath, writable: true); }
+                        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+                        {
+                            Log($"Image opened read-only ({ex.Message}).");
+                            source = new ImageDiskSource(filePath);
+                        }
+                    }
+                    return (Source: source, Layout: layout);
+                }
                 catch { source.Dispose(); throw; }
             });
             _diskSource = opened.Source;

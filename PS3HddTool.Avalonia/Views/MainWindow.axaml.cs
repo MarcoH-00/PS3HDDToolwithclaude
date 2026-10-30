@@ -66,6 +66,14 @@ public partial class MainWindow : Window
                 if (source is TreeViewItem item && item.DataContext is FileTreeNode node && node.InodeNumber > 0)
                     _vm.SelectedNode = node;
             }, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+
+            // Keyboard: Ctrl+X cut, Ctrl+V paste, F2 rename, Delete delete, Esc cancel cut.
+            tree.AddHandler(InputElement.KeyDownEvent, OnTreeKeyDown, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+
+            // Drag an item onto a folder to move it (upstream issue #3).
+            tree.AddHandler(InputElement.PointerPressedEvent, OnTreePointerPressedForDrag, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            tree.AddHandler(InputElement.PointerMovedEvent, OnTreePointerMovedForDrag, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            tree.AddHandler(InputElement.PointerReleasedEvent, (_, _) => _dragCandidate = null, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
         }
 
         var logList = this.FindControl<ListBox>("LogList");
@@ -84,8 +92,136 @@ public partial class MainWindow : Window
         }
     }
 
+    // ── Cut / paste / drag-to-move inside the PS3 filesystem ─────────────────────
+
+    private const string InternalDragFormat = "application/x-ps3hddtool-node";
+    private FileTreeNode? _dragCandidate;
+    private FileTreeNode? _draggedNode;
+    private global::Avalonia.Point _dragStart;
+
+    private static FileTreeNode? NodeFromEventSource(object? source)
+    {
+        var control = source as Control;
+        while (control != null && control is not TreeViewItem)
+            control = control.Parent as Control;
+        return (control as TreeViewItem)?.DataContext is FileTreeNode node && node.InodeNumber > 0 ? node : null;
+    }
+
+    private static bool IsInsideTree(object? source)
+    {
+        for (var c = source as Control; c != null; c = c.Parent as Control)
+            if (c is TreeView tv && tv.Name == "FileTreeView") return true;
+        return false;
+    }
+
+    private void OnTreePointerPressedForDrag(object? sender, PointerPressedEventArgs e)
+    {
+        _dragCandidate = null;
+        if (_vm.IsBusy || _vm.IsPs4 || sender is not Control tree) return;
+        if (!e.GetCurrentPoint(tree).Properties.IsLeftButtonPressed) return;
+        _dragCandidate = NodeFromEventSource(e.Source);
+        _dragStart = e.GetPosition(tree);
+    }
+
+    private async void OnTreePointerMovedForDrag(object? sender, PointerEventArgs e)
+    {
+        if (_dragCandidate == null || sender is not Control tree) return;
+        if (!e.GetCurrentPoint(tree).Properties.IsLeftButtonPressed) { _dragCandidate = null; return; }
+        var delta = e.GetPosition(tree) - _dragStart;
+        if (Math.Abs(delta.X) < 8 && Math.Abs(delta.Y) < 8) return;
+
+        var node = _dragCandidate;
+        _dragCandidate = null;
+        if (!_vm.CanWriteFiles || node.ParentInodeNumber == 0) return;
+
+        _draggedNode = node;
+        try
+        {
+            var data = new DataObject();
+            data.Set(InternalDragFormat, node.InodeNumber.ToString());
+            await DragDrop.DoDragDrop(e, data, DragDropEffects.Move);
+        }
+        finally { _draggedNode = null; }
+    }
+
+    private async void OnTreeKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (_vm.IsBusy || _vm.IsPs4) return;
+        bool ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.KeyModifiers.HasFlag(KeyModifiers.Meta);
+        if (ctrl && e.Key == Key.X) { e.Handled = true; _vm.CutSelected(); }
+        else if (ctrl && e.Key == Key.V) { e.Handled = true; await _vm.PasteAsync(); }
+        else if (e.Key == Key.Escape && _vm.HasClipboard) { e.Handled = true; _vm.ClearClipboard(); _vm.StatusText = "Cut cancelled."; }
+        else if (e.Key == Key.F2 && _vm.CanEditSelection) { e.Handled = true; OnRename(sender, new RoutedEventArgs()); }
+        else if (e.Key == Key.Delete && _vm.CanEditSelection) { e.Handled = true; OnDeleteSelected(sender, new RoutedEventArgs()); }
+    }
+
+    private void OnCut(object? sender, RoutedEventArgs e) => _vm.CutSelected();
+
+    private async void OnPaste(object? sender, RoutedEventArgs e) => await _vm.PasteAsync();
+
+    private void OnClearClipboard(object? sender, RoutedEventArgs e)
+    {
+        _vm.ClearClipboard();
+        _vm.StatusText = "Cut cancelled.";
+    }
+
+    /// <summary>Ask before a drag-move, since drags are easy to start by accident.</summary>
+    private async Task<bool> ConfirmMoveAsync(FileTreeNode node, string destinationPath)
+    {
+        var dialog = new Window
+        {
+            Title = "Move",
+            Width = 440, Height = 170,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        bool confirmed = false;
+        var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"Move '{node.FullPath}'\ninto '{destinationPath}'?" +
+                   (_vm.DryRunMode ? "\n\nFake writes are on: nothing will be changed." : ""),
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        });
+        var buttons = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        var moveBtn = new Button { Content = "Move", Classes = { "primary" } };
+        var cancelBtn = new Button { Content = "Cancel" };
+        moveBtn.Click += (_, _) => { confirmed = true; dialog.Close(); };
+        cancelBtn.Click += (_, _) => dialog.Close();
+        buttons.Children.Add(moveBtn);
+        buttons.Children.Add(cancelBtn);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+        await dialog.ShowDialog(this);
+        return confirmed;
+    }
+
+    private static FileTreeNode? FindNode(IEnumerable<FileTreeNode> nodes, long inode)
+    {
+        foreach (var n in nodes)
+        {
+            if (n.InodeNumber == inode) return n;
+            if (n.IsDirectory && n.ChildrenLoaded)
+            {
+                var found = FindNode(n.Children, inode);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
     private void OnDragOver(object? sender, DragEventArgs e)
     {
+        if (e.Data.Contains(InternalDragFormat))
+        {
+            var target = NodeFromEventSource(e.Source);
+            string? reason = _draggedNode == null || !IsInsideTree(e.Source)
+                ? "Drop onto a folder in the tree." : _vm.ExplainMoveRejection(_draggedNode, target);
+            e.DragEffects = reason == null ? DragDropEffects.Move : DragDropEffects.None;
+            return;
+        }
         e.DragEffects = HasDroppableFiles(e.Data) ? DragDropEffects.Copy : DragDropEffects.None;
     }
 
@@ -170,6 +306,33 @@ public partial class MainWindow : Window
     private async void OnDrop(object? sender, DragEventArgs e)
     {
         if (_vm.IsBusy) return;
+
+        if (e.Data.Contains(InternalDragFormat))
+        {
+            var dragged = _draggedNode;
+            var target = NodeFromEventSource(e.Source);
+            if (dragged == null || !IsInsideTree(e.Source)) return;
+            string? reason = _vm.ExplainMoveRejection(dragged, target);
+            if (reason != null) { _vm.StatusText = reason; return; }
+            var (_, destPath) = MainViewModel.ResolveDestination(target);
+            if (await ConfirmMoveAsync(dragged, destPath))
+                await _vm.MoveNodeAsync(dragged, target);
+            return;
+        }
+
+        // Files dropped from the computer go into the folder under the pointer
+        // (or the folder of the file under the pointer), not just the selection.
+        var dropTarget = NodeFromEventSource(e.Source);
+        if (dropTarget != null && _vm.IsFilesystemMounted && !_vm.IsPs4)
+        {
+            var (destInode, _) = MainViewModel.ResolveDestination(dropTarget);
+            if (dropTarget.IsDirectory) _vm.SelectedNode = dropTarget;
+            else
+            {
+                var parent = FindNode(_vm.FileTree, destInode);
+                _vm.SelectedNode = parent;
+            }
+        }
         var formats = string.Join(", ", e.Data.GetDataFormats());
         _vm.Log($"Drag-drop received. Formats: [{formats}]");
 

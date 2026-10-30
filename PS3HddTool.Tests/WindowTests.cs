@@ -66,7 +66,7 @@ internal static class WindowTests
                 CheckScreen(true);
                 foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG", "Extract PKG", "Saved keys", "Export", "Save" })
                     Check(!Button(label).IsEnabled, $"PS4 window enables {label}.");
-                foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG" })
+                foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG", "Cut", "Paste" })
                     Check(!Button(label).IsVisible, $"PS4 window shows {label}.");
                 var combo = Find<ComboBox>("Ps4PartitionPicker");
                 Check(Equals(combo.SelectedItem, vm.SelectedPs4Partition), "Partition selection binding failed.");
@@ -85,7 +85,7 @@ internal static class WindowTests
                 MenuItem Menu(string label) => menu.Items.OfType<MenuItem>().Single(m => Equals(m.Header, label));
                 menu.Open(Find<TreeView>("FileTreeView"));
                 Dispatcher.UIThread.RunJobs();
-                foreach (string label in new[] { "Rename…", "Delete" })
+                foreach (string label in new[] { "Rename…", "Delete", "Cut", "Paste here" })
                     Check(!Menu(label).IsEnabled && !Menu(label).IsVisible, $"PS4 menu exposes {label}.");
                 Check(Menu("Extract…").IsEnabled && Menu("Copy path").IsEnabled, "Read-only menu actions unavailable.");
                 menu.Close();

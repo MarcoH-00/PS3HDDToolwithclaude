@@ -35,6 +35,7 @@ public partial class MainViewModel
         OnPropertyChanged(nameof(PartitionCount));
         OnPropertyChanged(nameof(CanEditSelection));
         OnPropertyChanged(nameof(DetectedEncryptionType));
+        NotifyClipboard();
     }
 
     partial void OnIsBusyChanged(bool value) => NotifyCapabilities();
@@ -90,6 +91,7 @@ public partial class MainViewModel
 
     private void CloseDisk()
     {
+        ClearClipboard();
         ResetMountedFilesystem();
         _diskSource?.Dispose();
         _diskSource = null;

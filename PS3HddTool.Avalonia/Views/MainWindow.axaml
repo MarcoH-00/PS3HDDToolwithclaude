@@ -421,6 +421,22 @@
                             ToolTip.Tip="Copy a folder from this computer onto the PS3 drive"/>
                     <Button Content="New folder" Click="OnCreateDirectory"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"/>
+                    <Button Content="Cut" Click="OnCut"
+                            IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanCut}"
+                            ToolTip.Tip="Mark the selected item to move it (Ctrl+X). You can also drag items onto a folder."/>
+                    <Button Content="Paste" Click="OnPaste"
+                            IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanPaste}"
+                            ToolTip.Tip="Move the cut item into the selected folder (Ctrl+V)"/>
+                    <Border Classes="chip" VerticalAlignment="Center" Margin="4,0"
+                            IsVisible="{Binding HasClipboard}">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="{Binding ClipboardText}" FontSize="11" Foreground="#D9A05C"
+                                       MaxWidth="260" TextTrimming="CharacterEllipsis"
+                                       FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+                            <Button Content="✕" Padding="4,0" FontSize="10" Click="OnClearClipboard"
+                                    ToolTip.Tip="Cancel cut (Esc)"/>
+                        </StackPanel>
+                    </Border>
                     <Border Classes="sep-v"/>
                     <Button Content="Root" Click="OnGoToRoot"
                             ToolTip.Tip="Deselect — file operations target the root directory"/>
@@ -463,11 +479,19 @@
                                     <MenuItem Header="Extract…" Click="OnExtract"
                                               IsEnabled="{Binding CanExtract}"/>
                                     <MenuItem Name="RenameMenuItem" Header="Rename…" Click="OnRename"
+                                              InputGesture="F2"
                                               IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanEditSelection}"/>
+                                    <MenuItem Name="CutMenuItem" Header="Cut" Click="OnCut"
+                                              InputGesture="Ctrl+X"
+                                              IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanCut}"/>
+                                    <MenuItem Name="PasteMenuItem" Header="Paste here" Click="OnPaste"
+                                              InputGesture="Ctrl+V"
+                                              IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanPaste}"/>
                                     <MenuItem Header="Copy path" Click="OnCopyPath"
                                               IsEnabled="{Binding CanExtract}"/>
                                     <Separator IsVisible="{Binding !IsPs4}"/>
                                     <MenuItem Name="DeleteMenuItem" Header="Delete" Click="OnDeleteSelected" Foreground="#F07070"
+                                              InputGesture="Delete"
                                               IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanEditSelection}"/>
                                 </ContextMenu>
                             </TreeView.ContextMenu>
