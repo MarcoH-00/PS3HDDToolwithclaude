@@ -445,8 +445,10 @@ public class Ufs2Writer
                     else if (run > 0) { sums[Math.Min(run, contigsumsize)]++; run = 0; }
                 }
                 if (run > 0) sums[Math.Min(run, contigsumsize)]++;
-                for (int i = 0; i <= contigsumsize; i++)
-                    BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(clustersumoff + i * 4), i == 0 ? 0 : sums[i]);
+                // Index 0 is never written: newfs places cg_clustersumoff 4 bytes early so
+                // that unused slot overlaps the tail of the free-fragment bitmap.
+                for (int i = 1; i <= contigsumsize; i++)
+                    BinaryPrimitives.WriteInt32BigEndian(d.AsSpan(clustersumoff + i * 4), sums[i]);
             }
         }
 
