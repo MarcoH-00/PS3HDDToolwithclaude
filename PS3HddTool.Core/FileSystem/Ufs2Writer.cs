@@ -2299,17 +2299,23 @@ public class Ufs2Writer
     }
 
     /// <summary>Find <paramref name="count"/> free fragments inside one block, preferring a CG.</summary>
+    /// <remarks>
+    /// Directory fragments always start on a block boundary. The upstream reference
+    /// notes (bug 15) found the PS3 kernel misreads directories whose block starts
+    /// mid-block, so runs are carved from the start of an entirely free block.
+    /// </remarks>
     private (int CgNum, CylinderGroupInfo CgInfo, int Local) AllocFragments(int preferredCg, CylinderGroupInfo preferredCgInfo, int count)
     {
         var sb = _fs.Superblock!;
-        long local = FindFreeFragments(preferredCgInfo, count);
+        int fpb = (int)(sb.BlockSize / sb.FragmentSize);
+        long local = FindFreeFragments(preferredCgInfo, fpb);
         if (local >= 0) return (preferredCg, preferredCgInfo, (int)local);
         for (int i = 1; i < sb.CylinderGroups; i++)
         {
             int tryCg = (preferredCg + i) % sb.CylinderGroups;
             var info = ReadCylinderGroup(tryCg);
             if (info.Magic != 0x00090255) continue;
-            local = FindFreeFragments(info, count);
+            local = FindFreeFragments(info, fpb);
             if (local >= 0) return (tryCg, info, (int)local);
         }
         throw new IOException("No free space left for the directory.");
