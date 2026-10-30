@@ -76,13 +76,32 @@ jobs:
         run: |
           status=0
           for img in work/snapshots/*.img; do
+            name=$(basename "$img")
             echo "== fsck_ffs -n -f $img"
             out=$(fsck_ffs -n -f "$img" 2>&1); rc=$?
             echo "$out"
-            if [ $rc -ne 0 ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE'; then
-              msg=$(echo "$out" | grep -v '^\*\*' | tr '\n' '|' | cut -c1-3500)
-              echo "::error title=fsck_ffs found problems in $(basename "$img") (exit $rc)::$msg"
-              status=1
+            if [ $rc -ne 0 ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE|WRONG'; then
+              bad=1
+            else
+              bad=0
             fi
+            summary=$(echo "$out" | grep -v '^\*\*' | tr '\n' '|' | cut -c1-3000)
+            case "$name" in
+              *control*)
+                # Negative control: fsck MUST report the planted corruption.
+                if [ $bad -eq 1 ]; then
+                  echo "::notice title=fsck control ($name)::detected the planted corruption as expected: $summary"
+                else
+                  echo "::error title=fsck control ($name)::fsck did NOT detect the planted corruption — the oracle is not working: $summary"
+                  status=1
+                fi ;;
+              *)
+                if [ $bad -eq 1 ]; then
+                  echo "::error title=fsck_ffs found problems in $name (exit $rc)::$summary"
+                  status=1
+                else
+                  echo "::notice title=fsck clean ($name)::$summary"
+                fi ;;
+            esac
           done
           exit $status

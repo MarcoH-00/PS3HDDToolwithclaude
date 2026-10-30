@@ -135,7 +135,9 @@ internal static class Program
 
             Phase("verify final state", VerifyAll);
             Snapshot(snapshots, "03-final.img");
+            Phase("negative control for fsck", () => MakeCorruptedControl(Path.Combine(snapshots, "03-final.img"), Path.Combine(snapshots, "99-control-corrupted.img")));
 
+            Console.WriteLine($"::notice title=Writer harness::{_checks} checks passed, {Expected.Count} paths verified");
             Console.WriteLine($"HARNESS OK — {_checks} checks passed");
             return 0;
         }
@@ -253,6 +255,27 @@ internal static class Program
     });
 
     // ── helpers ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Copy an image and mark one in-use data fragment as free directly in the bitmap.
+    /// fsck must flag this copy; if it does not, the fsck step itself is not working.
+    /// </summary>
+    private static void MakeCorruptedControl(string source, string dest)
+    {
+        var cp = System.Diagnostics.Process.Start("cp", new[] { "--sparse=always", source, dest })!;
+        cp.WaitForExit();
+        using var disk = new ImageDiskSource(dest, writable: true);
+        var fs = new Ufs2FileSystem(disk, 0);
+        if (!fs.Mount()) throw new InvalidDataException("control image does not mount");
+        var writer = new Ufs2Writer(fs, disk, 0, dryRun: true, log: _ => { });
+        long target = fs.ResolvePath("/t/reuse_big")!.DirectBlocks[3];
+        int cgNum = (int)(target / fs.Superblock!.FragsPerGroup);
+        int local = (int)(target % fs.Superblock.FragsPerGroup);
+        var cg = writer.ReadCylinderGroup(cgNum);
+        cg.RawData[cg.FreeBlocksOffset + local / 8] |= (byte)(1 << (local % 8));
+        disk.WriteBytes(cg.DiskOffset, cg.RawData);
+        Log($"control: marked in-use fragment 0x{target:X} free in CG {cgNum}");
+    }
 
     private static void ProbeSuperblock()
     {
