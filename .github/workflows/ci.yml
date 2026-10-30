@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build solution
+        run: dotnet build PS3HddTool.sln -c Release
+
+      - name: Build writer harness
+        run: dotnet build PS3HddTool.WriterHarness -c Release
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          dotnet run --project PS3HddTool.Tests -c Release --no-build 2>&1 | tee tests.log || {
+            echo "::error title=Unit tests failed::$(tail -n 30 tests.log | tr '\n' '|' | cut -c1-3500)"
+            exit 1
+          }
+
+  writer-fsck:
+    name: Writer vs. NetBSD fsck_ffs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build writer harness
+        run: dotnet build PS3HddTool.WriterHarness -c Release
+
+      # A big-endian UFS2 image with PS3-like geometry (16 KiB blocks, 4 KiB fragments).
+      # Few inodes per cylinder group, so the harness can exhaust one (upstream issue #7).
+      - name: Create image in NetBSD
+        id: vm
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            set -e
+            mkdir -p work/seed
+            echo "seed" > work/seed/readme.txt
+            makefs -t ffs -B be -s 256m -o version=2,bsize=16384,fsize=4096,density=1048576 work/base.img work/seed
+            echo "== baseline fsck"
+            fsck_ffs -n -f work/base.img
+
+      - name: Run writer harness against the image
+        run: |
+          cp work/base.img work/test.img
+          dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- work/test.img work/snapshots
+
+      - name: fsck_ffs every snapshot
+        shell: netbsd {0}
+        run: |
+          status=0
+          for img in work/snapshots/*.img; do
+            echo "== fsck_ffs -n -f $img"
+            out=$(fsck_ffs -n -f "$img" 2>&1); rc=$?
+            echo "$out"
+            if [ $rc -ne 0 ] || echo "$out" | grep -Eq '\?|INCORRECT|MISSING|UNREF|BAD |DUP|CORRUPT|MISMATCH|EXCESSIVE'; then
+              msg=$(echo "$out" | grep -v '^\*\*' | tr '\n' '|' | cut -c1-3500)
+              echo "::error title=fsck_ffs found problems in $(basename "$img") (exit $rc)::$msg"
+              status=1
+            fi
+          done
+          exit $status

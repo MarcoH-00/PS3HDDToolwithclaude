@@ -2474,17 +2474,9 @@ public partial class MainViewModel : ObservableObject
                     DryRunMode, msg => Log(msg));
                 writer.VerboseLog = VerboseDiagnostics;
 
-                // Rename = move within same parent with different name
-                // Remove old entry, add new entry with same inode
-                writer.RemoveDirectoryEntry(parentInode, oldName);
-
-                var parentInodeData = writeFs.ReadInode(parentInode);
-                int fragsPerBlock = (int)(writeFs.Superblock!.BlockSize / writeFs.Superblock.FragmentSize);
-                int parentCg = (int)(parentInode / writeFs.Superblock.InodesPerGroup);
-                var cgInfo = writer.ReadCylinderGroup(parentCg);
-                byte entryType = isDir ? (byte)4 : (byte)8;
-                writer.AddEntryToDirectory(parentInode, parentInodeData, inodeNumber, newName, entryType,
-                    parentCg, cgInfo, parentCg, cgInfo, fragsPerBlock, out _, out _);
+                // Rename links the new name before removing the old one, validates the
+                // name and keeps the entry's original type (file, folder, symlink).
+                writer.RenameEntry(parentInode, oldName, newName);
 
                 if (!DryRunMode)
                 {
