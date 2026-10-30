@@ -1132,8 +1132,18 @@ public class Ufs2Writer
         // Update timestamps in memory regardless of defer mode
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         BinaryPrimitives.WriteInt32BigEndian(cg.RawData.AsSpan(0x08), (int)now);
-        if (cg.RawData.Length > 0x98)
-            BinaryPrimitives.WriteInt64BigEndian(cg.RawData.AsSpan(0x90), now);
+        // UFS2 cg_time is the int64 at 0x88 (FreeBSD/NetBSD struct cg); 0x90 is spare
+        // space that fsck expects to stay untouched ("SUMMARY INFORMATION BAD").
+        // Upstream always wrote 0x90, so update whichever slot already holds a
+        // plausible timestamp and fall back to the standard 0x88.
+        if (cg.RawData.Length >= 0x98)
+        {
+            static bool Plausible(long t) => t > 946_684_800 && t < 4_102_444_800; // 2000..2100
+            long at88 = BinaryPrimitives.ReadInt64BigEndian(cg.RawData.AsSpan(0x88));
+            long at90 = BinaryPrimitives.ReadInt64BigEndian(cg.RawData.AsSpan(0x90));
+            int slot = Plausible(at90) && !Plausible(at88) ? 0x90 : 0x88;
+            BinaryPrimitives.WriteInt64BigEndian(cg.RawData.AsSpan(slot), now);
+        }
         
         if (DeferCgWrites)
         {

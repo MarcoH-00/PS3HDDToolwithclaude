@@ -372,6 +372,8 @@ internal static class Program
             for (int i = 0; i < 8; i++) if (Be(0x34 + i * 4) != (i < fpb ? frsum[i] : 0)) diffs.Add($"frsum[{i}] {Be(0x34 + i * 4)}!={frsum[i]}");
             if (Be(0x28) >= ndblk || Be(0x2C) >= ndblk || Be(0x30) >= sb.InodesPerGroup) diffs.Add($"rotor out of range ({Be(0x28)},{Be(0x2C)},{Be(0x30)})");
             if (Be(0x78) > sb.InodesPerGroup) diffs.Add($"initediblk {Be(0x78)} > ipg");
+            for (int off = 0x7C; off < 0x88; off += 4) if (Be(off) != 0) diffs.Add($"spare32@0x{off:X}={Be(off)}");
+            for (int off = 0x90; off < 0xA8; off += 4) if (Be(off) != 0) diffs.Add($"spare64@0x{off:X}={Be(off)}");
             if (diffs.Count > 0) problems.Add($"CG {c} header: {string.Join(", ", diffs)}");
         }
 
