@@ -74,16 +74,16 @@ jobs:
       # time to stay within the VM's disk space.
       - name: fsck_ffs every snapshot (inside NetBSD)
         run: |
-          ssh netbsd 'rm -rf /var/tmp/fsck && mkdir -p /var/tmp/fsck && df -h /var/tmp' > df.txt 2>&1 || true
+          ssh -q -T netbsd 'rm -rf /var/tmp/fsck && mkdir -p /var/tmp/fsck && df -h /var/tmp' 2>&1 | tr -d '\r' > df.txt || true
           echo "::notice title=VM disk::$(tr '\n' '|' < df.txt)"
           status=0
           for img in work/snapshots/*.img; do
             name=$(basename "$img")
-            if ! tar -cSf - -C work/snapshots "$name" | gzip -1 | ssh netbsd 'cd /var/tmp/fsck && gunzip | tar -xf -' 2> copy.err; then
+            if ! tar -cSf - -C work/snapshots "$name" | gzip -1 | ssh -q -T netbsd 'cd /var/tmp/fsck && gunzip | tar -xf -' 2> copy.err; then
               echo "::error title=copy $name to VM failed::$(tr '\n' '|' < copy.err | cut -c1-800)"
               status=1; continue
             fi
-            ssh netbsd "fsck_ffs -n -f /var/tmp/fsck/$name; echo EXIT=\$?; rm -f /var/tmp/fsck/$name" > fsck.out 2>&1
+            ssh -q -T netbsd "fsck_ffs -n -f /var/tmp/fsck/$name; echo EXIT=\$?; rm -f /var/tmp/fsck/$name" 2>&1 | tr -d '\r' > fsck.out
             cat fsck.out
             rc=$(sed -n 's/^EXIT=//p' fsck.out | tail -n 1)
             out=$(grep -v '^EXIT=' fsck.out)
