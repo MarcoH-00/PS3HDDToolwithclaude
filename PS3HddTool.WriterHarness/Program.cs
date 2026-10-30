@@ -265,6 +265,7 @@ internal static class Program
             f.ReadExactly(buf);
             uint be = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(0x55C));
             uint le = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(0x55C));
+            Console.WriteLine($"::warning title=SB probe {sbOff}::magic BE=0x{be:X8} LE=0x{le:X8} size={f.Length}");
             Log($"offset {sbOff}: magic BE=0x{be:X8} LE=0x{le:X8} bsize(BE)={System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(buf.AsSpan(0x30))}");
         }
     }
