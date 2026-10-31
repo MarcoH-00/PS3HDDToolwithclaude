@@ -255,6 +255,36 @@ public class Ufs2FileSystem
         }
     }
 
+    /// <summary>Drop cached pages overlapping a written byte range.</summary>
+    public void InvalidateRange(long offset, long length)
+    {
+        if (length <= 0) return;
+        long first = offset / CachePageSize;
+        long last = (offset + length - 1) / CachePageSize;
+        lock (_cacheLock)
+        {
+            _cacheGeneration++;
+            if (last - first + 1 > _cachePages.Count)
+            {
+                foreach (long page in _cachePages.Keys.Where(p => p >= first && p <= last).ToList())
+                {
+                    _cacheLru.Remove(_cachePages[page]);
+                    _cachePages.Remove(page);
+                }
+            }
+            else
+            {
+                for (long page = first; page <= last; page++)
+                {
+                    if (_cachePages.Remove(page, out var node)) _cacheLru.Remove(node);
+                }
+            }
+        }
+    }
+
+    /// <summary>Cached read of a small metadata range (directory, inode or indirect blocks).</summary>
+    public byte[] ReadMetadata(long offset, int count) => ReadCached(offset, count);
+
     private byte[] ReadCached(long offset, int count)
     {
         if (count <= 0) return Array.Empty<byte>();

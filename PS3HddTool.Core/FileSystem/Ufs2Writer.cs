@@ -143,7 +143,7 @@ public class Ufs2Writer
                 }
                 prevChain?.Wait();
                 _writeTarget.WriteBytes(capturedOffset, EncSpan(encSlot, capturedBytes));
-                _fs.InvalidateCache();
+                _fs.InvalidateRange(capturedOffset, capturedBytes);
             });
 
             _pendingWrite = chain;
@@ -169,7 +169,7 @@ public class Ufs2Writer
             }
             
             long capturedOffset = offset;
-            _pendingWrite = Task.Run(() => { _disk.WriteBytes(capturedOffset, writeData); _fs.InvalidateCache(); });
+            _pendingWrite = Task.Run(() => { _disk.WriteBytes(capturedOffset, writeData); _fs.InvalidateRange(capturedOffset, writeData.Length); });
             _activeBuf = 1 - _activeBuf;
         }
         _batchStartFrag = -1;
@@ -301,7 +301,7 @@ public class Ufs2Writer
     }
 
     private byte[] ReadRawInode(long inodeNumber)
-        => _disk.ReadBytes(InodeDiskOffset(inodeNumber), (int)_fs.Superblock!.InodeSize);
+        => _fs.ReadMetadata(InodeDiskOffset(inodeNumber), (int)_fs.Superblock!.InodeSize);
 
     private void CheckFragmentAddress(long absFrag, int count, string what)
     {
@@ -493,7 +493,7 @@ public class Ufs2Writer
             int blockCapacity = (int)sb.BlockSize; // reads are bounded by di_size below
             int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
             long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-            byte[] block = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
+            byte[] block = _fs.ReadMetadata(blockDiskOffset, thisBlockSize);
 
             for (int sectionStart = 0; sectionStart + 512 <= thisBlockSize; sectionStart += 512)
             {
@@ -857,7 +857,7 @@ public class Ufs2Writer
                         long inodeBlockFrag = cgStart + sb.InodeBlockOffset + (long)blk * (sb.BlockSize / sb.FragmentSize);
                         long inodeBlockDiskOffset = _partitionOffset + inodeBlockFrag * sb.FragmentSize;
                         _disk.WriteBytes(inodeBlockDiskOffset, zeros);
-                        _fs.InvalidateCache();
+                        _fs.InvalidateRange(inodeBlockDiskOffset, zeros.Length);
                     }
                 }
                 sw.Stop();
@@ -1429,7 +1429,7 @@ public class Ufs2Writer
         if (_dryRun)
             return; // dry run just skips data blocks silently
         _disk.WriteBytes(offset, data);
-        _fs.InvalidateCache();
+        _fs.InvalidateRange(offset, data.Length);
     }
 
     /// <summary>
@@ -1456,6 +1456,7 @@ public class Ufs2Writer
     public long CreateDirectory(long parentInodeNumber, string name)
     {
         CommitPendingLinks();
+        CommitPendingFrees();
         var sb = _fs.Superblock!;
         ValidateEntryName(name);
         _log($"[WRITE] Creating directory '{name}' in inode {parentInodeNumber}");
@@ -1645,7 +1646,7 @@ public class Ufs2Writer
         }
         else
         {
-            rawParent = _disk.ReadBytes(
+            rawParent = _fs.ReadMetadata(
                 _partitionOffset + (parentInodeNumber / sb.InodesPerGroup) * sb.FragsPerGroup * sb.FragmentSize
                 + sb.InodeBlockOffset * sb.FragmentSize + (parentInodeNumber % sb.InodesPerGroup) * sb.InodeSize,
                 (int)sb.InodeSize);
@@ -1676,6 +1677,32 @@ public class Ufs2Writer
         public bool InodeWritten;
         public bool Linked;
         public bool RolledBack;
+    }
+
+    private readonly List<(long Inode, List<(long AbsFrag, int Count)> Runs)> _pendingFrees = new();
+
+    /// <summary>
+    /// Release the inodes and blocks of files unlinked by DeleteFile: one barrier makes the
+    /// removed directory entries stable, then the inodes are cleared (coalesced) and the
+    /// bitmaps updated.
+    /// </summary>
+    public void CommitPendingFrees()
+    {
+        if (_pendingFrees.Count == 0) return;
+        var sb = _fs.Superblock!;
+        var batch = _pendingFrees.ToList();
+        _pendingFrees.Clear();
+        if (SafeWriteOrdering) DurabilityBarrier();
+        WriteInodesCoalesced(batch.Select(f => (f.Inode, new byte[(int)sb.InodeSize])).ToList());
+        foreach (var (ino, runs) in batch)
+        {
+            foreach (var (absFrag, count) in runs)
+                FreeFragmentRun(absFrag, count);
+            var cg = ReadCylinderGroup((int)(ino / sb.InodesPerGroup));
+            MarkInodeFree(cg, (int)(ino % sb.InodesPerGroup));
+            WriteCylinderGroup(cg);
+        }
+        _log($"  Released {batch.Count} deleted file(s)");
     }
 
     private sealed record PendingLink(long Parent, string Name, long Inode, byte[] InodeData,
@@ -1757,7 +1784,7 @@ public class Ufs2Writer
                 foreach (var (ino, data) in items) WriteInode(ino, data);
                 continue;
             }
-            byte[] span = _disk.ReadBytes(spanStart, (int)(spanEnd - spanStart));
+            byte[] span = _fs.ReadMetadata(spanStart, (int)(spanEnd - spanStart));
             foreach (var (ino, data) in items)
                 Array.Copy(data, 0, span, InodeDiskOffset(ino) - spanStart, isize);
             QueueWrite(spanStart, span, $"{items.Count} inodes ({items[0].Inode}..{items[^1].Inode})");
@@ -2010,7 +2037,7 @@ public class Ufs2Writer
                     _pendingWrite?.Wait();
                     long tailOffset = _partitionOffset + (absFragAddr * sb.FragmentSize);
                     _disk.WriteBytes(tailOffset, tailBuf);
-                    _fs.InvalidateCache();
+                    _fs.InvalidateRange(tailOffset, tailBuf.Length);
                 }
                 totalFlushedBytes += tailSize;
                 flushCount++;
@@ -2252,7 +2279,7 @@ public class Ufs2Writer
             int blockCapacity = (int)sb.BlockSize;
             int thisBlockSize = (int)Math.Min(blockCapacity, bytesLeft);
             long blockDiskOffset = _partitionOffset + blockAddr * sb.FragmentSize;
-            byte[] dirBlock = _disk.ReadBytes(blockDiskOffset, thisBlockSize);
+            byte[] dirBlock = _fs.ReadMetadata(blockDiskOffset, thisBlockSize);
 
             try
             {
@@ -2461,17 +2488,17 @@ public class Ufs2Writer
             {
                 // Already sector-aligned — write directly, no read needed
                 _disk.WriteBytes(diskOffset, data);
-                _fs.InvalidateCache();
+                _fs.InvalidateRange(diskOffset, data.Length);
             }
             else
             {
                 // Unaligned write — read-modify-write
                 long alignedEnd = ((diskOffset + data.Length + sectorSize - 1) / sectorSize) * sectorSize;
                 int alignedLen = (int)(alignedEnd - alignedStart);
-                byte[] aligned = _disk.ReadBytes(alignedStart, alignedLen);
+                byte[] aligned = _fs.ReadMetadata(alignedStart, alignedLen);
                 Array.Copy(data, 0, aligned, startDelta, data.Length);
                 _disk.WriteBytes(alignedStart, aligned);
-                _fs.InvalidateCache();
+                _fs.InvalidateRange(alignedStart, aligned.Length);
             }
         }
     }
@@ -2505,6 +2532,7 @@ public class Ufs2Writer
         // Flush all pending data writes and deferred CG writes first, and make them
         // stable before the superblock summary that describes them is rewritten.
         CommitPendingLinks();
+        CommitPendingFrees();
         ReleaseBatchReservation();
         FlushDataBatch();
         FlushDirtyCgs();
@@ -2784,7 +2812,7 @@ public class Ufs2Writer
         {
             if (addr == 0) return;
             CheckFragmentAddress(addr, fpb, $"Indirect block (level {level}) of inode {inode.InodeNumber}");
-            byte[] blk = _disk.ReadBytes(_partitionOffset + addr * sb.FragmentSize, (int)sb.BlockSize);
+            byte[] blk = _fs.ReadMetadata(_partitionOffset + addr * sb.FragmentSize, (int)sb.BlockSize);
             for (int p = 0; p < blk.Length / 8; p++)
             {
                 long ptr = BinaryPrimitives.ReadInt64BigEndian(blk.AsSpan(p * 8));
@@ -2912,27 +2940,25 @@ public class Ufs2Writer
         var runs = inode.LinkCount > 1 ? new List<(long AbsFrag, int Count)>() : CollectInodeFragments(inode);
 
         // 1. Unlink first: a crash afterwards leaks space instead of leaving a name
-        //    that points at a released inode.
+        //    that points at a released inode. The barrier that makes the unlink stable
+        //    runs when the queued releases are committed.
         RemoveDirectoryEntry(parentInodeNumber, name, fileInodeNumber);
-        if (SafeWriteOrdering) DurabilityBarrier();
 
         if (inode.LinkCount > 1)
         {
             // Other names still reference this inode: just drop one link.
+            if (SafeWriteOrdering) DurabilityBarrier();
             ChangeLinkCount(fileInodeNumber, -1);
             _log($"  Removed one of {inode.LinkCount} links to inode {fileInodeNumber}");
             return;
         }
 
-        // 2. Release the inode and its blocks.
-        WriteInode(fileInodeNumber, new byte[(int)sb.InodeSize]);
-        foreach (var (absFrag, count) in runs)
-            FreeFragmentRun(absFrag, count);
-        int cgNum = (int)(fileInodeNumber / sb.InodesPerGroup);
-        var cg = ReadCylinderGroup(cgNum);
-        MarkInodeFree(cg, (int)(fileInodeNumber % sb.InodesPerGroup));
-        WriteCylinderGroup(cg);
-        _log($"  File '{name}' deleted");
+        // 2. Release the inode and its blocks — queued, so that deleting many files costs
+        //    one durability barrier per group instead of one per file. Until the group is
+        //    committed the space simply stays allocated (a crash only leaks it).
+        _pendingFrees.Add((fileInodeNumber, runs));
+        if (_pendingFrees.Count >= GroupCommitMaxFiles) CommitPendingFrees();
+        _log($"  File '{name}' unlinked (release queued)");
     }
 
     /// <summary>
@@ -2941,6 +2967,7 @@ public class Ufs2Writer
     public void DeleteDirectory(long parentInodeNumber, string name, long dirInodeNumber)
     {
         CommitPendingLinks();
+        CommitPendingFrees();
         var sb = _fs.Superblock!;
         _log($"[DELETE] Deleting directory '{name}' (inode {dirInodeNumber}) from parent {parentInodeNumber}");
         if (dirInodeNumber == 2) throw new IOException("Refusing to delete the root directory.");
@@ -2991,6 +3018,7 @@ public class Ufs2Writer
     public void RenameEntry(long parentInodeNumber, string oldName, string newName)
     {
         CommitPendingLinks();
+        CommitPendingFrees();
         var sb = _fs.Superblock!;
         int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
         ValidateEntryName(newName);
@@ -3021,6 +3049,7 @@ public class Ufs2Writer
     public void MoveEntry(long srcParentInode, long destParentInode, string name, string newName, long entryInode)
     {
         CommitPendingLinks();
+        CommitPendingFrees();
         var sb = _fs.Superblock!;
         int fragsPerBlock = (int)(sb.BlockSize / sb.FragmentSize);
         ValidateEntryName(newName);
@@ -3242,7 +3271,7 @@ public class Ufs2Writer
             byte[] aligned = _disk.ReadBytes(alignedStart, alignedLen);
             Array.Copy(write.Data, 0, aligned, startDelta, write.Data.Length);
             _disk.WriteBytes(alignedStart, aligned);
-            _fs.InvalidateCache();
+            _fs.InvalidateRange(alignedStart, aligned.Length);
             _log($"  Committed: {write.Description}");
         }
         _log($"All {_pendingWrites.Count} writes committed.");
