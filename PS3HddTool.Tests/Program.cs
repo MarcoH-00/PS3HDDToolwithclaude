@@ -37,6 +37,7 @@ internal static class Program
             Test("PS4 IV modes, key order and failed-key rejection", () => TestMount(plain, cipher));
             Test("PS3 CBC and XTS filesystem regression", TestPs3);
             Test("Malformed UFS2 and extraction destination rejection", TestInvalidUfs);
+            Test("Cut/paste destination rules", TestMoveRules);
             await TestViewModel(image);
             Console.WriteLine("PASS view model import, mount, browse, extract, switching, write guards and recovery");
             _passed++;
@@ -48,6 +49,45 @@ internal static class Program
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+    }
+
+    private static void TestMoveRules()
+    {
+        var game = new PS3HddTool.Core.Models.FileTreeNode { Name = "game", FullPath = "/game", InodeNumber = 10, ParentInodeNumber = 2, IsDirectory = true };
+        var title = new PS3HddTool.Core.Models.FileTreeNode { Name = "BLUS1", FullPath = "/game/BLUS1", InodeNumber = 11, ParentInodeNumber = 10, IsDirectory = true };
+        var sub = new PS3HddTool.Core.Models.FileTreeNode { Name = "USRDIR", FullPath = "/game/BLUS1/USRDIR", InodeNumber = 12, ParentInodeNumber = 11, IsDirectory = true };
+        var file = new PS3HddTool.Core.Models.FileTreeNode { Name = "EBOOT.BIN", FullPath = "/game/BLUS1/USRDIR/EBOOT.BIN", InodeNumber = 13, ParentInodeNumber = 12 };
+        var other = new PS3HddTool.Core.Models.FileTreeNode { Name = "BLUS2", FullPath = "/game/BLUS2", InodeNumber = 20, ParentInodeNumber = 10, IsDirectory = true };
+
+        Check(MainViewModel.ResolveDestination(null) == (2, "/"), "Null target should be root.");
+        Check(MainViewModel.ResolveDestination(other) == (20, "/game/BLUS2"), "Folder target should be the folder itself.");
+        Check(MainViewModel.ResolveDestination(file) == (12, "/game/BLUS1/USRDIR"), "File target should be its folder.");
+
+        var vm = new MainViewModel(new DriveProfileDatabase(Path.Combine(Output, "profiles-move")),
+            new PS3HddTool.Avalonia.RecentSourcesStore(Path.Combine(Output, "recents-move")));
+        // Not mounted: every move is refused with a reason.
+        Check(vm.ExplainMoveRejection(file, other) != null, "Move allowed without a mounted filesystem.");
+        Check(!vm.CanPaste && !vm.HasClipboard, "Clipboard should start empty.");
+
+        // Multi-select: a ticked folder absorbs its ticked descendants.
+        game.Children.Clear(); game.Children.Add(title); game.Children.Add(other); game.ChildrenLoaded = true;
+        title.Children.Clear(); title.Children.Add(sub); title.ChildrenLoaded = true;
+        sub.Children.Clear(); sub.Children.Add(file); sub.ChildrenLoaded = true;
+        vm.FileTree.Add(game);
+        vm.IsMultiSelectMode = true;
+        title.IsChecked = true; file.IsChecked = true; other.IsChecked = true;
+        vm.RefreshCheckedCount();
+        Check(vm.CheckedCount == 3 && vm.HasCheckedItems, "Checked count is wrong.");
+        var targets = vm.ActionTargets();
+        Check(targets.Count == 2 && targets.Contains(title) && targets.Contains(other), "Descendant of a ticked folder was not dropped.");
+        vm.SelectedNode = game;
+        vm.CheckAllInCurrentFolder();
+        Check(title.IsChecked && other.IsChecked && vm.CheckedCount == 3, "Select all in folder failed.");
+        vm.IsMultiSelectMode = false;
+        Check(vm.CheckedCount == 0 && !file.IsChecked, "Leaving multi-select did not clear ticks.");
+        Check(vm.ActionTargets().Single() == game, "Without multi-select the selection is the target.");
+        Check(!vm.IsPhysicalDrive, "No physical drive is open.");
+        vm.Cleanup();
     }
 
     private static void TestUfs(bool little)

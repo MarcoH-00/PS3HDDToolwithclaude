@@ -1,3 +1,4 @@
+using CommunityToolkit.Mvvm.ComponentModel;
 using System.Collections.ObjectModel;
 
 namespace PS3HddTool.Avalonia.ViewModels;
@@ -7,7 +8,7 @@ public partial class MainViewModel
     private readonly RecentSourcesStore _recentSourcesStore;
     public ObservableCollection<RecentSourceEntry> RecentSources { get; } = new();
 
-    public bool CanEditSelection => CanWriteFiles && SelectedNode != null;
+    public bool CanEditSelection => CanWriteFiles && (SelectedNode != null || (IsMultiSelectMode && CheckedCount > 0));
     public string WriteModeHint => IsPs4
         ? "PS4 disks are opened read-only. Extract files and folders to your computer."
         : "Fake-write mode is on by default. File writes are simulated until you turn it off.";
@@ -73,6 +74,36 @@ public partial class MainViewModel
     {
         RecentSources.Remove(entry);
         _recentSourcesStore.Save(RecentSources);
+    }
+
+    [ObservableProperty] private bool _isPhysicalDrive;
+
+    /// <summary>
+    /// Close the drive and ask the operating system to safely remove it from the PC
+    /// (Windows "Safely Remove Hardware", Linux udisksctl power-off, macOS diskutil eject).
+    /// </summary>
+    public async Task<PS3HddTool.Core.Disk.DriveEjector.Result?> SafelyRemoveDriveAsync()
+    {
+        if (IsBusy) return null;
+        string? path = _physicalDrivePath;
+        if (path == null)
+        {
+            StatusText = "Safe removal is only available for a physical drive.";
+            return null;
+        }
+        try
+        {
+            IsBusy = true;
+            StatusText = $"Closing {path} and asking the system to remove it — do not unplug yet...";
+            try { _diskSource?.Flush(); } catch (Exception ex) { Log($"Flush before removal failed: {ex.Message}"); }
+            CloseDisk();
+            Log($"Drive closed. Requesting safe removal of {path}...");
+            var result = await Task.Run(() => PS3HddTool.Core.Disk.DriveEjector.Eject(path));
+            Log((result.Success ? "SAFE TO UNPLUG: " : "NOT SAFE TO UNPLUG: ") + result.Message);
+            StatusText = result.Message;
+            return result;
+        }
+        finally { IsBusy = false; }
     }
 
     public void Eject()

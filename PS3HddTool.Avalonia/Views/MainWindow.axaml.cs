@@ -24,6 +24,16 @@ public partial class MainWindow : Window
 
         Closing += (_, _) => _vm.Cleanup();
 
+        // Linux without root: say why drives are missing instead of showing an empty list.
+        if (LinuxElevation.StartupWarning is string elevationWarning)
+        {
+            _vm.Log(elevationWarning);
+            if (!Design.IsDesignMode && Environment.GetEnvironmentVariable("PS3HDDTOOL_ELEVATION_STATUS") != null)
+                _vm.StatusText = elevationWarning;
+        }
+        else if (LinuxElevation.IsRoot)
+            _vm.Log("Running with administrator rights (physical drives available).");
+
         // Enable drag-drop for EID key .bin files
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DropEvent, OnDrop);
@@ -66,6 +76,21 @@ public partial class MainWindow : Window
                 if (source is TreeViewItem item && item.DataContext is FileTreeNode node && node.InodeNumber > 0)
                     _vm.SelectedNode = node;
             }, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+
+            // Multi-select checkboxes: recount whenever one is clicked.
+            tree.AddHandler(Button.ClickEvent, (_, e) =>
+            {
+                if (e.Source is CheckBox)
+                    global::Avalonia.Threading.Dispatcher.UIThread.Post(_vm.RefreshCheckedCount);
+            });
+
+            // Keyboard: Ctrl+X cut, Ctrl+V paste, F2 rename, Delete delete, Esc cancel cut.
+            tree.AddHandler(InputElement.KeyDownEvent, OnTreeKeyDown, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+
+            // Drag an item onto a folder to move it (upstream issue #3).
+            tree.AddHandler(InputElement.PointerPressedEvent, OnTreePointerPressedForDrag, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            tree.AddHandler(InputElement.PointerMovedEvent, OnTreePointerMovedForDrag, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            tree.AddHandler(InputElement.PointerReleasedEvent, (_, _) => _dragCandidate = null, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
         }
 
         var logList = this.FindControl<ListBox>("LogList");
@@ -73,19 +98,221 @@ public partial class MainWindow : Window
         {
             void ScrollLogToLatest(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs args)
             {
+                // Scroll by index: log lines can repeat, and ScrollIntoView(item) would jump to
+                // the first identical line. Background priority lets the new row lay out first.
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
                     if (IsVisible && logList.IsEffectivelyVisible && _vm.LogMessages.Count > 0)
-                        logList.ScrollIntoView(_vm.LogMessages[^1]);
-                });
+                        logList.ScrollIntoView(_vm.LogMessages.Count - 1);
+                }, global::Avalonia.Threading.DispatcherPriority.Background);
             }
             _vm.LogMessages.CollectionChanged += ScrollLogToLatest;
+            // When the log is reopened, jump to the newest line.
+            var logToggle = this.FindControl<global::Avalonia.Controls.Primitives.ToggleButton>("LogToggle");
+            if (logToggle != null)
+            {
+                logToggle.PropertyChanged += (_, args) =>
+                {
+                    if (args.Property == global::Avalonia.Controls.Primitives.ToggleButton.IsCheckedProperty && logToggle.IsChecked == true)
+                        ScrollLogToLatest(null, null!);
+                };
+            }
             Closed += (_, _) => _vm.LogMessages.CollectionChanged -= ScrollLogToLatest;
         }
     }
 
+    // ── Cut / paste / drag-to-move inside the PS3 filesystem ─────────────────────
+
+    private const string InternalDragFormat = "application/x-ps3hddtool-node";
+    private FileTreeNode? _dragCandidate;
+    private FileTreeNode? _draggedNode;
+    private global::Avalonia.Point _dragStart;
+
+    private static FileTreeNode? NodeFromEventSource(object? source)
+    {
+        var control = source as Control;
+        while (control != null && control is not TreeViewItem)
+            control = control.Parent as Control;
+        return (control as TreeViewItem)?.DataContext is FileTreeNode node && node.InodeNumber > 0 ? node : null;
+    }
+
+    private static bool IsInsideTree(object? source)
+    {
+        for (var c = source as Control; c != null; c = c.Parent as Control)
+            if (c is TreeView tv && tv.Name == "FileTreeView") return true;
+        return false;
+    }
+
+    private void OnTreePointerPressedForDrag(object? sender, PointerPressedEventArgs e)
+    {
+        _dragCandidate = null;
+        if (_vm.IsBusy || _vm.IsPs4 || sender is not Control tree) return;
+        if (!e.GetCurrentPoint(tree).Properties.IsLeftButtonPressed) return;
+        _dragCandidate = NodeFromEventSource(e.Source);
+        _dragStart = e.GetPosition(tree);
+    }
+
+    private async void OnTreePointerMovedForDrag(object? sender, PointerEventArgs e)
+    {
+        if (_dragCandidate == null || sender is not Control tree) return;
+        if (!e.GetCurrentPoint(tree).Properties.IsLeftButtonPressed) { _dragCandidate = null; return; }
+        var delta = e.GetPosition(tree) - _dragStart;
+        if (Math.Abs(delta.X) < 8 && Math.Abs(delta.Y) < 8) return;
+
+        var node = _dragCandidate;
+        _dragCandidate = null;
+        if (!_vm.CanWriteFiles || node.ParentInodeNumber == 0) return;
+
+        _draggedNode = node;
+        try
+        {
+            var data = new DataObject();
+            data.Set(InternalDragFormat, node.InodeNumber.ToString());
+            await DragDrop.DoDragDrop(e, data, DragDropEffects.Move);
+        }
+        finally { _draggedNode = null; }
+    }
+
+    private async void OnTreeKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (_vm.IsBusy || _vm.IsPs4) return;
+        bool ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.KeyModifiers.HasFlag(KeyModifiers.Meta);
+        if (ctrl && e.Key == Key.X) { e.Handled = true; _vm.CutSelected(); }
+        else if (ctrl && e.Key == Key.V) { e.Handled = true; await _vm.PasteAsync(); }
+        else if (e.Key == Key.Escape && _vm.HasClipboard) { e.Handled = true; _vm.ClearClipboard(); _vm.StatusText = "Cut cancelled."; }
+        else if (e.Key == Key.F2 && _vm.CanEditSelection) { e.Handled = true; OnRename(sender, new RoutedEventArgs()); }
+        else if (e.Key == Key.Delete && _vm.CanEditSelection) { e.Handled = true; OnDeleteSelected(sender, new RoutedEventArgs()); }
+    }
+
+    private void OnCut(object? sender, RoutedEventArgs e) => _vm.CutSelected();
+
+    private void OnCheckAll(object? sender, RoutedEventArgs e) => _vm.CheckAllInCurrentFolder();
+
+    private void OnUncheckAll(object? sender, RoutedEventArgs e) => _vm.UncheckAll();
+
+    private async void OnSafelyRemoveDrive(object? sender, RoutedEventArgs e)
+    {
+        if (_vm.IsBusy || !_vm.IsPhysicalDrive) return;
+        var dialog = new Window
+        {
+            Title = "Safely remove drive",
+            Width = 440, Height = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        bool confirmed = false;
+        var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Close the drive in PS3 HDD Tool and ask the system to remove it from this PC?\n\n" +
+                   "When it reports success you can unplug the drive.",
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        });
+        var buttons = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        var okBtn = new Button { Content = "Remove", Classes = { "primary" } };
+        var cancelBtn = new Button { Content = "Cancel" };
+        okBtn.Click += (_, _) => { confirmed = true; dialog.Close(); };
+        cancelBtn.Click += (_, _) => dialog.Close();
+        buttons.Children.Add(okBtn);
+        buttons.Children.Add(cancelBtn);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+        await dialog.ShowDialog(this);
+        if (!confirmed) return;
+        var result = await _vm.SafelyRemoveDriveAsync();
+        if (result == null) return;
+
+        // Make the outcome impossible to miss: unplugging too early is what hurts the drive.
+        var done = new Window
+        {
+            Title = result.Success ? "Safe to unplug" : "Do NOT unplug yet",
+            Width = 460, Height = 200,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        var donePanel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        donePanel.Children.Add(new TextBlock
+        {
+            Text = (result.Success ? "✔ " : "✖ ") + result.Message,
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
+            Foreground = global::Avalonia.Media.Brush.Parse(result.Success ? "#5FB86A" : "#F07070")
+        });
+        var ok = new Button { Content = "OK", HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        ok.Click += (_, _) => done.Close();
+        donePanel.Children.Add(ok);
+        done.Content = donePanel;
+        await done.ShowDialog(this);
+    }
+
+    private async void OnPaste(object? sender, RoutedEventArgs e) => await _vm.PasteAsync();
+
+    private void OnClearClipboard(object? sender, RoutedEventArgs e)
+    {
+        _vm.ClearClipboard();
+        _vm.StatusText = "Cut cancelled.";
+    }
+
+    /// <summary>Ask before a drag-move, since drags are easy to start by accident.</summary>
+    private async Task<bool> ConfirmMoveAsync(FileTreeNode node, string destinationPath)
+    {
+        var dialog = new Window
+        {
+            Title = "Move",
+            Width = 440, Height = 170,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        bool confirmed = false;
+        var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"Move '{node.FullPath}'\ninto '{destinationPath}'?" +
+                   (_vm.DryRunMode ? "\n\nFake writes are on: nothing will be changed." : ""),
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        });
+        var buttons = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        var moveBtn = new Button { Content = "Move", Classes = { "primary" } };
+        var cancelBtn = new Button { Content = "Cancel" };
+        moveBtn.Click += (_, _) => { confirmed = true; dialog.Close(); };
+        cancelBtn.Click += (_, _) => dialog.Close();
+        buttons.Children.Add(moveBtn);
+        buttons.Children.Add(cancelBtn);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+        await dialog.ShowDialog(this);
+        return confirmed;
+    }
+
+    private static FileTreeNode? FindNode(IEnumerable<FileTreeNode> nodes, long inode)
+    {
+        foreach (var n in nodes)
+        {
+            if (n.InodeNumber == inode) return n;
+            if (n.IsDirectory && n.ChildrenLoaded)
+            {
+                var found = FindNode(n.Children, inode);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
     private void OnDragOver(object? sender, DragEventArgs e)
     {
+        if (e.Data.Contains(InternalDragFormat))
+        {
+            var target = NodeFromEventSource(e.Source);
+            string? reason = _draggedNode == null || !IsInsideTree(e.Source)
+                ? "Drop onto a folder in the tree." : _vm.ExplainMoveRejection(_draggedNode, target);
+            e.DragEffects = reason == null ? DragDropEffects.Move : DragDropEffects.None;
+            return;
+        }
         e.DragEffects = HasDroppableFiles(e.Data) ? DragDropEffects.Copy : DragDropEffects.None;
     }
 
@@ -170,6 +397,33 @@ public partial class MainWindow : Window
     private async void OnDrop(object? sender, DragEventArgs e)
     {
         if (_vm.IsBusy) return;
+
+        if (e.Data.Contains(InternalDragFormat))
+        {
+            var dragged = _draggedNode;
+            var target = NodeFromEventSource(e.Source);
+            if (dragged == null || !IsInsideTree(e.Source)) return;
+            string? reason = _vm.ExplainMoveRejection(dragged, target);
+            if (reason != null) { _vm.StatusText = reason; return; }
+            var (_, destPath) = MainViewModel.ResolveDestination(target);
+            if (await ConfirmMoveAsync(dragged, destPath))
+                await _vm.MoveNodeAsync(dragged, target);
+            return;
+        }
+
+        // Files dropped from the computer go into the folder under the pointer
+        // (or the folder of the file under the pointer), not just the selection.
+        var dropTarget = NodeFromEventSource(e.Source);
+        if (dropTarget != null && _vm.IsFilesystemMounted && !_vm.IsPs4)
+        {
+            var (destInode, _) = MainViewModel.ResolveDestination(dropTarget);
+            if (dropTarget.IsDirectory) _vm.SelectedNode = dropTarget;
+            else
+            {
+                var parent = FindNode(_vm.FileTree, destInode);
+                _vm.SelectedNode = parent;
+            }
+        }
         var formats = string.Join(", ", e.Data.GetDataFormats());
         _vm.Log($"Drag-drop received. Formats: [{formats}]");
 
@@ -325,6 +579,17 @@ public partial class MainWindow : Window
             FontWeight = global::Avalonia.Media.FontWeight.SemiBold,
             Margin = new global::Avalonia.Thickness(0, 0, 0, 4)
         });
+        if (OperatingSystem.IsLinux() && !LinuxElevation.IsRoot)
+        {
+            dialog.Height += 40;
+            panel.Children.Add(new TextBlock
+            {
+                Text = "Not running as administrator: drives cannot be listed. Restart PS3 HDD Tool and enter your password when asked.",
+                TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
+                Foreground = global::Avalonia.Media.Brush.Parse("#F07070"),
+                FontSize = 11.5
+            });
+        }
 
         var driveCombo = new ComboBox
         {
@@ -1066,7 +1331,20 @@ public partial class MainWindow : Window
     private async void OnExtract(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanExtract) return;
-        var node = _vm.SelectedNode!;
+        var targets = _vm.ActionTargets();
+        if (targets.Count == 0) return;
+        if (targets.Count > 1)
+        {
+            var dest = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = $"Extract {targets.Count} items to…",
+                AllowMultiple = false
+            });
+            string? destPath = dest.Count > 0 ? dest[0].TryGetLocalPath() : null;
+            if (destPath != null) await _vm.ExtractTargetsToFolderAsync(destPath);
+            return;
+        }
+        var node = targets[0];
 
         if (node.IsDirectory)
         {
@@ -1212,9 +1490,12 @@ public partial class MainWindow : Window
     private async void OnDeleteSelected(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanEditSelection) return;
+        var targets = _vm.ActionTargets();
+        if (targets.Count == 0) return;
+        bool many = targets.Count > 1 || _vm.IsMultiSelectMode;
 
-        string name = _vm.SelectedNode!.Name;
-        string type = _vm.SelectedNode.IsDirectory ? "directory" : "file";
+        string name = many ? $"{targets.Count} selected item(s)" : targets[0].Name;
+        string type = many ? "" : targets[0].IsDirectory ? "directory" : "file";
 
         // Confirmation dialog
         var dialog = new Window
@@ -1231,7 +1512,10 @@ public partial class MainWindow : Window
         var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
         panel.Children.Add(new TextBlock 
         { 
-            Text = $"Delete {type} '{name}'?\n\nThis cannot be undone.",
+            Text = many
+                ? $"Delete {name}?\n\n" + string.Join("\n", targets.Take(8).Select(t => "  " + t.FullPath)) +
+                  (targets.Count > 8 ? $"\n  … and {targets.Count - 8} more" : "") + "\n\nThis cannot be undone."
+                : $"Delete {type} '{name}'?\n\nThis cannot be undone.",
             TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
         });
         var btnPanel = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
@@ -1244,10 +1528,14 @@ public partial class MainWindow : Window
         panel.Children.Add(btnPanel);
         dialog.Content = panel;
 
+        if (many) dialog.Height = Math.Min(420, 190 + 18 * Math.Min(targets.Count, 9));
         await dialog.ShowDialog(this);
 
         if (confirmed)
-            await _vm.DeleteSelectedAsync();
+        {
+            if (many) await _vm.DeleteTargetsAsync();
+            else await _vm.DeleteSelectedAsync();
+        }
     }
 
     private async void OnRename(object? sender, RoutedEventArgs e)
