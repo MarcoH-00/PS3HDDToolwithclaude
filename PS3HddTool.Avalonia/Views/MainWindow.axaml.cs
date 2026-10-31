@@ -98,11 +98,15 @@ public partial class MainWindow : Window
             }
             _vm.LogMessages.CollectionChanged += ScrollLogToLatest;
             // When the log is reopened, jump to the newest line.
-            logList.PropertyChanged += (_, args) =>
+            var logToggle = this.FindControl<global::Avalonia.Controls.Primitives.ToggleButton>("LogToggle");
+            if (logToggle != null)
             {
-                if (args.Property == IsEffectivelyVisibleProperty && logList.IsEffectivelyVisible)
-                    ScrollLogToLatest(null, null!);
-            };
+                logToggle.PropertyChanged += (_, args) =>
+                {
+                    if (args.Property == global::Avalonia.Controls.Primitives.ToggleButton.IsCheckedProperty && logToggle.IsChecked == true)
+                        ScrollLogToLatest(null, null!);
+                };
+            }
             Closed += (_, _) => _vm.LogMessages.CollectionChanged -= ScrollLogToLatest;
         }
     }
