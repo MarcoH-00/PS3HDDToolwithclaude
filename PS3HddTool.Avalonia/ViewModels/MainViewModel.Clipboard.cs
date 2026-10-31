@@ -14,7 +14,8 @@ public partial class MainViewModel
     private readonly List<FileTreeNode> _cutNodes = new();
 
     [ObservableProperty] private string _clipboardText = "";
-    [ObservableProperty] private bool _isMultiSelectMode;
+    // Checkboxes are always on: ticking items is the normal way to act on several at once.
+    [ObservableProperty] private bool _isMultiSelectMode = true;
     [ObservableProperty] private int _checkedCount;
 
     public bool HasClipboard => _cutNodes.Count > 0;

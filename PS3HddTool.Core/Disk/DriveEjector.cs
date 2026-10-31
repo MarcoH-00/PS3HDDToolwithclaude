@@ -35,8 +35,19 @@ public static class DriveEjector
     {
         Run("sync", Array.Empty<string>(), out _);
 
+        // A desktop may have auto-mounted a partition of the drive (the PS3's FAT cache
+        // partition, for example); power-off refuses while anything is mounted.
+        foreach (string part in MountedPartitionsOf(devicePath))
+        {
+            int urc = Run("udisksctl", new[] { "unmount", "-b", part }, out string uout, timeoutMs: 120_000);
+            if (urc != 0)
+                return new Result(false, $"{part} is mounted and could not be unmounted: {Trim(uout)}");
+        }
+
         // udisks2 powers the drive down so it can be unplugged (USB docks, SATA hot-plug).
-        int rc = Run("udisksctl", new[] { "power-off", "-b", devicePath, "--no-user-interaction" }, out string output);
+        // Same command as running "udisksctl power-off -b /dev/sdX" by hand: the desktop's
+        // polkit agent can ask for a password, so allow time for that.
+        int rc = Run("udisksctl", new[] { "power-off", "-b", devicePath }, out string output, timeoutMs: 120_000);
         if (rc == 0)
             return new Result(true, $"{devicePath} was powered off. You can unplug it now.");
 
@@ -61,7 +72,27 @@ public static class DriveEjector
             : new Result(false, $"diskutil could not eject {devicePath}: {Trim(output)}");
     }
 
-    private static int Run(string file, string[] args, out string output)
+    /// <summary>Partitions of <paramref name="devicePath"/> listed in /proc/mounts.</summary>
+    private static IEnumerable<string> MountedPartitionsOf(string devicePath)
+    {
+        var result = new List<string>();
+        try
+        {
+            foreach (string line in File.ReadLines("/proc/mounts"))
+            {
+                string dev = line.Split(' ', 2)[0];
+                if (!dev.StartsWith(devicePath, StringComparison.Ordinal) || dev == devicePath) continue;
+                // /dev/sda -> /dev/sda1, /dev/nvme0n1 -> /dev/nvme0n1p1 (but not /dev/sdab1).
+                string rest = dev[devicePath.Length..].TrimStart('p');
+                if (rest.Length > 0 && rest.All(char.IsDigit) && !result.Contains(dev))
+                    result.Add(dev);
+            }
+        }
+        catch { /* not Linux or not readable: nothing to unmount */ }
+        return result;
+    }
+
+    private static int Run(string file, string[] args, out string output, int timeoutMs = 60_000)
     {
         try
         {
@@ -75,7 +106,7 @@ public static class DriveEjector
             using var p = Process.Start(psi)!;
             string stdout = p.StandardOutput.ReadToEnd();
             string stderr = p.StandardError.ReadToEnd();
-            if (!p.WaitForExit(60_000)) { try { p.Kill(); } catch { } output = "timed out"; return -1; }
+            if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } output = "timed out"; return -1; }
             output = (stdout + " " + stderr).Trim();
             return p.ExitCode;
         }

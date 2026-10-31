@@ -427,14 +427,9 @@
                     <Button Content="New folder" Click="OnCreateDirectory"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"/>
                     <Border Classes="sep-v"/>
-                    <ToggleButton Name="MultiSelectToggle" IsChecked="{Binding IsMultiSelectMode}"
-                                  VerticalAlignment="Center"
-                                  ToolTip.Tip="Show checkboxes to select several files and folders at once">
-                        <TextBlock Text="☑ Select multiple"/>
-                    </ToggleButton>
-                    <Button Content="All" Click="OnCheckAll" IsVisible="{Binding IsMultiSelectMode}"
+                    <Button Content="Select all" Click="OnCheckAll"
                             ToolTip.Tip="Tick every item in the selected folder (or the root)"/>
-                    <Button Content="None" Click="OnUncheckAll" IsVisible="{Binding IsMultiSelectMode}"
+                    <Button Content="Select none" Click="OnUncheckAll"
                             IsEnabled="{Binding HasCheckedItems}"/>
                     <Border Classes="chip" VerticalAlignment="Center" Margin="4,0"
                             IsVisible="{Binding HasCheckedItems}">
