@@ -24,6 +24,16 @@ public partial class MainWindow : Window
 
         Closing += (_, _) => _vm.Cleanup();
 
+        // Linux without root: say why drives are missing instead of showing an empty list.
+        if (LinuxElevation.StartupWarning is string elevationWarning)
+        {
+            _vm.Log(elevationWarning);
+            if (!Design.IsDesignMode && Environment.GetEnvironmentVariable("PS3HDDTOOL_ELEVATION_STATUS") != null)
+                _vm.StatusText = elevationWarning;
+        }
+        else if (LinuxElevation.IsRoot)
+            _vm.Log("Running with administrator rights (physical drives available).");
+
         // Enable drag-drop for EID key .bin files
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DropEvent, OnDrop);
@@ -569,6 +579,17 @@ public partial class MainWindow : Window
             FontWeight = global::Avalonia.Media.FontWeight.SemiBold,
             Margin = new global::Avalonia.Thickness(0, 0, 0, 4)
         });
+        if (OperatingSystem.IsLinux() && !LinuxElevation.IsRoot)
+        {
+            dialog.Height += 40;
+            panel.Children.Add(new TextBlock
+            {
+                Text = "Not running as administrator: drives cannot be listed. Restart PS3 HDD Tool and enter your password when asked.",
+                TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
+                Foreground = global::Avalonia.Media.Brush.Parse("#F07070"),
+                FontSize = 11.5
+            });
+        }
 
         var driveCombo = new ComboBox
         {
