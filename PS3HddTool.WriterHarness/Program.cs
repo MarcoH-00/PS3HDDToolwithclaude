@@ -17,6 +17,16 @@ internal static class Program
 
     public static int Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--bench")
+        {
+            try { return Bench.Run(args[1], args[2]); }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"::error title=Benchmark failed::{ex.GetType().Name}: {ex.Message}".Replace("\r", " ").Replace("\n", " "));
+                Console.Error.WriteLine(ex);
+                return 1;
+            }
+        }
         if (args.Length != 2)
         {
             Console.Error.WriteLine("Usage: PS3HddTool.WriterHarness <image.img> <snapshot-dir>");

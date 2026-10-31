@@ -64,6 +64,9 @@ jobs:
             echo "== baseline fsck"
             fsck_ffs -n -f work/base.img
 
+      - name: Benchmark (encrypted stack, I/O counts and timings)
+        run: dotnet run --project PS3HddTool.WriterHarness -c Release --no-build -- --bench work/base.img work/bench
+
       - name: Run writer harness against the image
         run: |
           cp --sparse=always work/base.img work/test.img
