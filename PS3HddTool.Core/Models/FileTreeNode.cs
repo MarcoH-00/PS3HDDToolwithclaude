@@ -6,9 +6,27 @@ namespace PS3HddTool.Core.Models;
 /// <summary>
 /// Represents a node in the filesystem tree for the GUI.
 /// </summary>
-public class FileTreeNode
+public class FileTreeNode : System.ComponentModel.INotifyPropertyChanged
 {
     public static readonly FileTreeNode DummyChild = new() { Name = "Loading..." };
+
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+
+    private bool _isChecked;
+    /// <summary>Ticked in multi-select mode.</summary>
+    public bool IsChecked
+    {
+        get => _isChecked;
+        set
+        {
+            if (_isChecked == value) return;
+            _isChecked = value;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(IsChecked)));
+        }
+    }
+
+    /// <summary>False for the "Loading..." placeholder row.</summary>
+    public bool IsSelectable => InodeNumber > 0;
 
     public string Name { get; set; } = "";
     public string? DisplayName { get; set; }

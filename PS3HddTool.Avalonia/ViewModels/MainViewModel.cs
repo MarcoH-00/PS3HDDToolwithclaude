@@ -198,6 +198,7 @@ public partial class MainViewModel : ObservableObject
             _diskSource = opened.Source;
             _physicalDrivePath = drive.Path;
             _physicalDriveSize = drive.Size;
+            IsPhysicalDrive = true;
             FinishOpeningDisk(opened.Layout);
             RecordRecentSource(drive.Path, "drive", _diskSource.TotalSize);
             Log($"Drive loaded: {_diskSource.Description}");
@@ -1919,13 +1920,25 @@ public partial class MainViewModel : ObservableObject
     public void Log(string message)
     {
         string timestamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
-        LogMessages.Add(timestamped);
+        // Log is called from worker threads too; the bound collection must only change
+        // on the UI thread, or the list (and its auto-scroll) can miss or reorder lines.
+        var dispatcher = global::Avalonia.Threading.Dispatcher.UIThread;
+        if (dispatcher.CheckAccess()) AddLogLine(timestamped);
+        else dispatcher.Post(() => AddLogLine(timestamped));
 
         try
         {
             File.AppendAllText(LogFilePath, timestamped + Environment.NewLine);
         }
         catch { /* Don't crash if log file can't be written */ }
+    }
+
+    private const int MaxLogLines = 5000;
+
+    private void AddLogLine(string line)
+    {
+        LogMessages.Add(line);
+        while (LogMessages.Count > MaxLogLines) LogMessages.RemoveAt(0);
     }
 
     private void LogSeparator()

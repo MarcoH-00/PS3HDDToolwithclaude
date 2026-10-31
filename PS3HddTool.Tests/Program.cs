@@ -68,6 +68,25 @@ internal static class Program
         // Not mounted: every move is refused with a reason.
         Check(vm.ExplainMoveRejection(file, other) != null, "Move allowed without a mounted filesystem.");
         Check(!vm.CanPaste && !vm.HasClipboard, "Clipboard should start empty.");
+
+        // Multi-select: a ticked folder absorbs its ticked descendants.
+        game.Children.Clear(); game.Children.Add(title); game.Children.Add(other); game.ChildrenLoaded = true;
+        title.Children.Clear(); title.Children.Add(sub); title.ChildrenLoaded = true;
+        sub.Children.Clear(); sub.Children.Add(file); sub.ChildrenLoaded = true;
+        vm.FileTree.Add(game);
+        vm.IsMultiSelectMode = true;
+        title.IsChecked = true; file.IsChecked = true; other.IsChecked = true;
+        vm.RefreshCheckedCount();
+        Check(vm.CheckedCount == 3 && vm.HasCheckedItems, "Checked count is wrong.");
+        var targets = vm.ActionTargets();
+        Check(targets.Count == 2 && targets.Contains(title) && targets.Contains(other), "Descendant of a ticked folder was not dropped.");
+        vm.SelectedNode = game;
+        vm.CheckAllInCurrentFolder();
+        Check(title.IsChecked && other.IsChecked && vm.CheckedCount == 3, "Select all in folder failed.");
+        vm.IsMultiSelectMode = false;
+        Check(vm.CheckedCount == 0 && !file.IsChecked, "Leaving multi-select did not clear ticks.");
+        Check(vm.ActionTargets().Single() == game, "Without multi-select the selection is the target.");
+        Check(!vm.IsPhysicalDrive, "No physical drive is open.");
         vm.Cleanup();
     }
 

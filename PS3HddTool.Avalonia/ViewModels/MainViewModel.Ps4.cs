@@ -17,7 +17,7 @@ public partial class MainViewModel
     public ObservableCollection<Ps4Partition> Ps4Partitions { get; } = new();
     public bool CanMount => !IsBusy && IsDiskOpen && (!IsPs4 || SelectedPs4Partition?.CanBrowse == true);
     public bool CanWriteFiles => !IsBusy && IsFilesystemMounted && !IsPs4;
-    public bool CanExtract => !IsBusy && IsFilesystemMounted && SelectedNode != null;
+    public bool CanExtract => !IsBusy && IsFilesystemMounted && (SelectedNode != null || (IsMultiSelectMode && CheckedCount > 0));
     public bool CanUsePs3Tools => !IsBusy && !IsPs4;
     public bool ShowPs3Partitions => IsDecrypted && !IsPs4;
     public int PartitionCount => IsPs4 ? Ps4Partitions.Count : Partitions.Count;
@@ -103,6 +103,7 @@ public partial class MainViewModel
         DiskInfo = null;
         _physicalDrivePath = null;
         _physicalDriveSize = 0;
+        IsPhysicalDrive = false;
         _isXts = false;
         _cbcKey = null;
         _xtsDataKey = null;

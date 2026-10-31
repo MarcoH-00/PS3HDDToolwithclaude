@@ -67,6 +67,13 @@ public partial class MainWindow : Window
                     _vm.SelectedNode = node;
             }, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
 
+            // Multi-select checkboxes: recount whenever one is clicked.
+            tree.AddHandler(Button.ClickEvent, (_, e) =>
+            {
+                if (e.Source is CheckBox)
+                    global::Avalonia.Threading.Dispatcher.UIThread.Post(_vm.RefreshCheckedCount);
+            });
+
             // Keyboard: Ctrl+X cut, Ctrl+V paste, F2 rename, Delete delete, Esc cancel cut.
             tree.AddHandler(InputElement.KeyDownEvent, OnTreeKeyDown, global::Avalonia.Interactivity.RoutingStrategies.Tunnel);
 
@@ -81,13 +88,21 @@ public partial class MainWindow : Window
         {
             void ScrollLogToLatest(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs args)
             {
+                // Scroll by index: log lines can repeat, and ScrollIntoView(item) would jump to
+                // the first identical line. Background priority lets the new row lay out first.
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
                     if (IsVisible && logList.IsEffectivelyVisible && _vm.LogMessages.Count > 0)
-                        logList.ScrollIntoView(_vm.LogMessages[^1]);
-                });
+                        logList.ScrollIntoView(_vm.LogMessages.Count - 1);
+                }, global::Avalonia.Threading.DispatcherPriority.Background);
             }
             _vm.LogMessages.CollectionChanged += ScrollLogToLatest;
+            // When the log is reopened, jump to the newest line.
+            logList.PropertyChanged += (_, args) =>
+            {
+                if (args.Property == IsEffectivelyVisibleProperty && logList.IsEffectivelyVisible)
+                    ScrollLogToLatest(null, null!);
+            };
             Closed += (_, _) => _vm.LogMessages.CollectionChanged -= ScrollLogToLatest;
         }
     }
@@ -156,6 +171,43 @@ public partial class MainWindow : Window
     }
 
     private void OnCut(object? sender, RoutedEventArgs e) => _vm.CutSelected();
+
+    private void OnCheckAll(object? sender, RoutedEventArgs e) => _vm.CheckAllInCurrentFolder();
+
+    private void OnUncheckAll(object? sender, RoutedEventArgs e) => _vm.UncheckAll();
+
+    private async void OnSafelyRemoveDrive(object? sender, RoutedEventArgs e)
+    {
+        if (_vm.IsBusy || !_vm.IsPhysicalDrive) return;
+        var dialog = new Window
+        {
+            Title = "Safely remove drive",
+            Width = 440, Height = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        bool confirmed = false;
+        var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Close the drive in PS3 HDD Tool and ask the system to remove it from this PC?\n\n" +
+                   "When it reports success you can unplug the drive.",
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        });
+        var buttons = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        var okBtn = new Button { Content = "Remove", Classes = { "primary" } };
+        var cancelBtn = new Button { Content = "Cancel" };
+        okBtn.Click += (_, _) => { confirmed = true; dialog.Close(); };
+        cancelBtn.Click += (_, _) => dialog.Close();
+        buttons.Children.Add(okBtn);
+        buttons.Children.Add(cancelBtn);
+        panel.Children.Add(buttons);
+        dialog.Content = panel;
+        await dialog.ShowDialog(this);
+        if (confirmed) await _vm.SafelyRemoveDriveAsync();
+    }
 
     private async void OnPaste(object? sender, RoutedEventArgs e) => await _vm.PasteAsync();
 
@@ -1229,7 +1281,20 @@ public partial class MainWindow : Window
     private async void OnExtract(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanExtract) return;
-        var node = _vm.SelectedNode!;
+        var targets = _vm.ActionTargets();
+        if (targets.Count == 0) return;
+        if (targets.Count > 1)
+        {
+            var dest = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = $"Extract {targets.Count} items to…",
+                AllowMultiple = false
+            });
+            string? destPath = dest.Count > 0 ? dest[0].TryGetLocalPath() : null;
+            if (destPath != null) await _vm.ExtractTargetsToFolderAsync(destPath);
+            return;
+        }
+        var node = targets[0];
 
         if (node.IsDirectory)
         {
@@ -1375,9 +1440,12 @@ public partial class MainWindow : Window
     private async void OnDeleteSelected(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanEditSelection) return;
+        var targets = _vm.ActionTargets();
+        if (targets.Count == 0) return;
+        bool many = targets.Count > 1 || _vm.IsMultiSelectMode;
 
-        string name = _vm.SelectedNode!.Name;
-        string type = _vm.SelectedNode.IsDirectory ? "directory" : "file";
+        string name = many ? $"{targets.Count} selected item(s)" : targets[0].Name;
+        string type = many ? "" : targets[0].IsDirectory ? "directory" : "file";
 
         // Confirmation dialog
         var dialog = new Window
@@ -1394,7 +1462,10 @@ public partial class MainWindow : Window
         var panel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
         panel.Children.Add(new TextBlock 
         { 
-            Text = $"Delete {type} '{name}'?\n\nThis cannot be undone.",
+            Text = many
+                ? $"Delete {name}?\n\n" + string.Join("\n", targets.Take(8).Select(t => "  " + t.FullPath)) +
+                  (targets.Count > 8 ? $"\n  … and {targets.Count - 8} more" : "") + "\n\nThis cannot be undone."
+                : $"Delete {type} '{name}'?\n\nThis cannot be undone.",
             TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
         });
         var btnPanel = new StackPanel { Orientation = global::Avalonia.Layout.Orientation.Horizontal, Spacing = 8, HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
@@ -1407,10 +1478,14 @@ public partial class MainWindow : Window
         panel.Children.Add(btnPanel);
         dialog.Content = panel;
 
+        if (many) dialog.Height = Math.Min(420, 190 + 18 * Math.Min(targets.Count, 9));
         await dialog.ShowDialog(this);
 
         if (confirmed)
-            await _vm.DeleteSelectedAsync();
+        {
+            if (many) await _vm.DeleteTargetsAsync();
+            else await _vm.DeleteSelectedAsync();
+        }
     }
 
     private async void OnRename(object? sender, RoutedEventArgs e)

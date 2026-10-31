@@ -238,9 +238,14 @@
 
                 <Panel Grid.Column="3"/>
 
-                <Button Grid.Column="4" Content="Eject" Click="OnEject" Margin="0,0,6,0"
-                        IsVisible="{Binding IsDiskOpen}" IsEnabled="{Binding !IsBusy}"
-                        ToolTip.Tip="Close the current disk and return to setup"/>
+                <StackPanel Grid.Column="4" Orientation="Horizontal">
+                    <Button Content="Eject" Click="OnEject" Margin="0,0,6,0"
+                            IsVisible="{Binding IsDiskOpen}" IsEnabled="{Binding !IsBusy}"
+                            ToolTip.Tip="Close the current disk and return to setup"/>
+                    <Button Name="SafelyRemoveButton" Content="Safely remove drive" Click="OnSafelyRemoveDrive" Margin="0,0,6,0"
+                            IsVisible="{Binding IsPhysicalDrive}" IsEnabled="{Binding !IsBusy}"
+                            ToolTip.Tip="Close the drive and ask the system to remove it from the PC so it can be unplugged safely"/>
+                </StackPanel>
                 <Button Grid.Column="5" Content="Extract PKG" Click="OnExtractPkg" Margin="0,0,6,0"
                         ToolTip.Tip="Unpack a .pkg file to a folder on this computer" IsEnabled="{Binding CanUsePs3Tools}"/>
                 <Button Grid.Column="6" Content="About" Click="OnAbout"/>
@@ -421,6 +426,21 @@
                             ToolTip.Tip="Copy a folder from this computer onto the PS3 drive"/>
                     <Button Content="New folder" Click="OnCreateDirectory"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"/>
+                    <Border Classes="sep-v"/>
+                    <ToggleButton Name="MultiSelectToggle" IsChecked="{Binding IsMultiSelectMode}"
+                                  VerticalAlignment="Center"
+                                  ToolTip.Tip="Show checkboxes to select several files and folders at once">
+                        <TextBlock Text="☑ Select multiple"/>
+                    </ToggleButton>
+                    <Button Content="All" Click="OnCheckAll" IsVisible="{Binding IsMultiSelectMode}"
+                            ToolTip.Tip="Tick every item in the selected folder (or the root)"/>
+                    <Button Content="None" Click="OnUncheckAll" IsVisible="{Binding IsMultiSelectMode}"
+                            IsEnabled="{Binding HasCheckedItems}"/>
+                    <Border Classes="chip" VerticalAlignment="Center" Margin="4,0"
+                            IsVisible="{Binding HasCheckedItems}">
+                        <TextBlock Text="{Binding CheckedCountText}" FontSize="11" Foreground="#D9A05C"/>
+                    </Border>
+                    <Border Classes="sep-v"/>
                     <Button Content="Cut" Click="OnCut"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanCut}"
                             ToolTip.Tip="Mark the selected item to move it (Ctrl+X). You can also drag items onto a folder."/>
@@ -497,12 +517,21 @@
                             </TreeView.ContextMenu>
                             <TreeView.ItemTemplate>
                                 <TreeDataTemplate ItemsSource="{Binding Children}">
-                                    <Grid ColumnDefinitions="Auto,*,Auto" Margin="2,2">
-                                        <TextBlock Text="{Binding Icon}" FontSize="13"
+                                    <Grid ColumnDefinitions="Auto,Auto,*,Auto" Margin="2,2">
+                                        <CheckBox Grid.Column="0" Classes="treecheck" IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                                  MinWidth="0" Padding="0" Margin="0,0,6,0" VerticalAlignment="Center">
+                                            <CheckBox.IsVisible>
+                                                <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                                    <Binding Path="$parent[Window].DataContext.IsMultiSelectMode"/>
+                                                    <Binding Path="IsSelectable"/>
+                                                </MultiBinding>
+                                            </CheckBox.IsVisible>
+                                        </CheckBox>
+                                        <TextBlock Grid.Column="1" Text="{Binding Icon}" FontSize="13"
                                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                        <TextBlock Grid.Column="1" Text="{Binding Label}" FontSize="12"
+                                        <TextBlock Grid.Column="2" Text="{Binding Label}" FontSize="12"
                                                    VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
-                                        <TextBlock Grid.Column="2" Text="{Binding SizeFormatted}" FontSize="10"
+                                        <TextBlock Grid.Column="3" Text="{Binding SizeFormatted}" FontSize="10"
                                                    Foreground="#6B675E" VerticalAlignment="Center"
                                                    Margin="8,0,4,0" FontFamily="Consolas,Menlo,monospace"
                                                    IsVisible="{Binding !IsDirectory}"/>
@@ -619,7 +648,7 @@
         <Border Grid.Row="4" Background="#1B1A17" BorderBrush="#272622" BorderThickness="0,1,0,0"
                 Padding="10,4">
             <Grid ColumnDefinitions="Auto,Auto,*,Auto,Auto,Auto">
-                <ToggleButton Grid.Column="0" Name="LogToggle" Classes="ghost"
+                <ToggleButton Grid.Column="0" Name="LogToggle" Classes="ghost" IsChecked="True"
                               ToolTip.Tip="Show or hide the activity log">
                     <StackPanel Orientation="Horizontal" Spacing="5">
                         <TextBlock Text="▴" FontSize="10" VerticalAlignment="Center"
