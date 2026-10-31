@@ -62,6 +62,7 @@ public partial class MainViewModel : ObservableObject
     partial void OnSelectedNodeChanged(FileTreeNode? value)
     {
         NotifyCapabilities();
+        StartFolderStats(value);
         if (value != null && value.IsDirectory && !value.ChildrenLoaded)
         {
             _ = ExpandNodeAsync(value);
@@ -2163,109 +2164,7 @@ public partial class MainViewModel : ObservableObject
             StatusText = "Mount a filesystem first.";
             return;
         }
-        StatusText = "Use the 'Copy File to PS3' button in the toolbar.";
-    }
-
-    public async Task CopyFileToPs3WithPath(string sourceFilePath)
-    {
-        if (RejectPs4Write() || IsBusy) return;
-        if (_fileSystem == null) return;
-
-        long parentInodeNumber = 2;
-        if (SelectedNode != null && SelectedNode.IsDirectory)
-            parentInodeNumber = SelectedNode.InodeNumber;
-
-        try
-        {
-            IsBusy = true;
-            IsProgressIndeterminate = false;
-            ProgressValue = 0;
-            string fileName = Path.GetFileName(sourceFilePath);
-            long fileSize = new FileInfo(sourceFilePath).Length;
-
-            StatusText = DryRunMode 
-                ? $"[FAKE WRITE TEST] Copying '{fileName}' ({FormatSize(fileSize)})..." 
-                : $"Copying '{fileName}' ({FormatSize(fileSize)})...";
-
-            await Task.Run(() =>
-            {
-                IDiskSource writeDisk = _fileSystem.DiskSource;
-                Ufs2FileSystem writeFs = _fileSystem;
-
-                var writer = new PS3HddTool.Core.FileSystem.Ufs2Writer(
-                    writeFs, writeDisk, writeFs.PartitionOffsetBytes,
-                    DryRunMode, msg => Log(msg));
-                writer.VerboseLog = VerboseDiagnostics;
-
-                using var fs = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-
-                // Wrap in a progress-reporting stream
-                var copyStart = DateTime.UtcNow;
-                var progressStream = new ProgressStream(fs, fileSize, (bytesRead, total) =>
-                {
-                    double pct = total > 0 ? (double)bytesRead / total * 100 : 0;
-                    ProgressValue = pct;
-                    var elapsed = (DateTime.UtcNow - copyStart).TotalSeconds;
-                    double speedMBps = elapsed > 0.1 ? (bytesRead / (1024.0 * 1024.0)) / elapsed : 0;
-                    string eta = "";
-                    if (speedMBps > 0.01 && bytesRead < total)
-                    {
-                        double remainMB = (total - bytesRead) / (1024.0 * 1024.0);
-                        int etaSec = (int)(remainMB / speedMBps);
-                        eta = etaSec >= 60 ? $"  ETA {etaSec / 60}m{etaSec % 60}s" : $"  ETA {etaSec}s";
-                    }
-                    ProgressText = $"{pct:F1}%  {FormatSize(bytesRead)}/{FormatSize(total)}  {speedMBps:F1} MB/s{eta}";
-                });
-
-                writer.WriteFile(parentInodeNumber, fileName, progressStream, fileSize);
-
-                if (!DryRunMode)
-                {
-                    writer.UpdateSuperblock();
-                    Log($"File '{fileName}' copied successfully.");
-                }
-                else
-                    Log($"[FAKE WRITE TEST] {writer.PendingWrites.Count} writes would be performed. No data written.");
-
-                // io diag to verify which write path actually carried the data & at what rate... this goes past the bulk flush timing in Ufs2Writer
-                if (_diskSource is PhysicalDiskSource pds)
-                {
-                    Log($"  IO unbuffered handle: {pds.UnbufferedHandleStatus}");
-                    if (pds.UnbufferedBytesWritten > 0)
-                    {
-                        double mb = pds.UnbufferedBytesWritten / (1024.0 * 1024.0);
-                        double sec = pds.UnbufferedWriteMs / 1000.0;
-                        Log($"  IO unbuffered: {mb:F1} MB in {pds.UnbufferedWriteMs} ms = {(sec > 0 ? mb / sec : 0):F1} MB/s");
-                    }
-                    if (pds.BufferedBytesWritten > 0)
-                    {
-                        double mb = pds.BufferedBytesWritten / (1024.0 * 1024.0);
-                        double sec = pds.BufferedWriteMs / 1000.0;
-                        Log($"  IO buffered: {mb:F2} MB in {pds.BufferedWriteMs} ms = {(sec > 0 ? mb / sec : 0):F1} MB/s");
-                    }
-                }
-            });
-
-            StatusText = DryRunMode 
-                ? $"[FAKE WRITE TEST] Would copy '{fileName}' — check log for details" 
-                : $"File '{fileName}' copied!";
-
-            if (!DryRunMode)
-            {
-                await Task.Run(() =>
-                {
-                    _fileSystem?.Mount();
-                });
-                RefreshFreeSpace();
-                await LoadDirectoryTreeAsync();
-            }
-        }
-        catch (Exception ex)
-        {
-            StatusText = $"Error: {ex.Message}";
-            Log($"ERROR copying file: {ex.Message}");
-        }
-        finally { IsBusy = false; IsProgressIndeterminate = false; ProgressValue = 0; ProgressText = ""; }
+        StatusText = "Use the 'Copy to PS3' button in the toolbar.";
     }
 
     /// <summary>
@@ -2314,156 +2213,6 @@ public partial class MainViewModel : ObservableObject
     public void SetPromptFunc(Func<string, string, Task<string?>> func) => _promptFunc = func;
     private Task<string?> PromptForInput(string title, string message) =>
         _promptFunc?.Invoke(title, message) ?? Task.FromResult<string?>(null);
-
-    public async Task CopyFolderToPs3WithPath(string sourceFolderPath)
-    {
-        if (RejectPs4Write() || IsBusy) return;
-        if (_fileSystem == null) return;
-
-        long parentInodeNumber = 2;
-        if (SelectedNode != null && SelectedNode.IsDirectory)
-            parentInodeNumber = SelectedNode.InodeNumber;
-
-        try
-        {
-            IsBusy = true;
-            IsProgressIndeterminate = false;
-            ProgressValue = 0;
-            string folderName = Path.GetFileName(sourceFolderPath);
-
-            // Count total files and size
-            var allFiles = Directory.GetFiles(sourceFolderPath, "*", SearchOption.AllDirectories);
-            long totalSize = allFiles.Sum(f => new FileInfo(f).Length);
-            int totalFiles = allFiles.Length;
-            var allDirs = Directory.GetDirectories(sourceFolderPath, "*", SearchOption.AllDirectories);
-
-            StatusText = DryRunMode
-                ? $"[FAKE WRITE TEST] Copying folder '{folderName}' ({totalFiles} files, {FormatSize(totalSize)})..."
-                : $"Copying folder '{folderName}' ({totalFiles} files, {FormatSize(totalSize)})...";
-            Log($"[WRITE] Copying folder '{sourceFolderPath}' → PS3 ({totalFiles} files, {allDirs.Length} subdirs, {FormatSize(totalSize)})");
-
-            await Task.Run(() =>
-            {
-                IDiskSource writeDisk = _fileSystem.DiskSource;
-                Ufs2FileSystem writeFs = _fileSystem;
-
-                var writer = new PS3HddTool.Core.FileSystem.Ufs2Writer(
-                    writeFs, writeDisk, writeFs.PartitionOffsetBytes,
-                    DryRunMode, msg => Log(msg));
-                writer.VerboseLog = VerboseDiagnostics;
-
-                // Track created directory inodes by path
-                var dirInodes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-
-                // Create root folder
-                long rootDirInode = writer.CreateDirectory(parentInodeNumber, folderName);
-                dirInodes[sourceFolderPath] = rootDirInode;
-                Log($"  Created root folder '{folderName}' as inode {rootDirInode}");
-
-                // Process directories breadth-first, writing FILES before SUBDIRS
-                // at each level to match PS3 native directory entry ordering.
-                int filesDone = 0;
-                long bytesDone = 0;
-                var startTime = DateTime.UtcNow;
-                var dirsToProcess = new Queue<string>();
-                dirsToProcess.Enqueue(sourceFolderPath);
-
-                while (dirsToProcess.Count > 0)
-                {
-                    string currentDir = dirsToProcess.Dequeue();
-
-                    if (!dirInodes.TryGetValue(currentDir, out long currentInode))
-                    {
-                        Log($"  WARNING: Inode not found for {currentDir}, skipping");
-                        continue;
-                    }
-
-                    // 1. Write all FILES in this directory first
-                    foreach (var file in Directory.GetFiles(currentDir))
-                    {
-                        string fileName = Path.GetFileName(file);
-                        long fileSize = new FileInfo(file).Length;
-
-                        string relativePath = file.Substring(sourceFolderPath.Length).TrimStart(Path.DirectorySeparatorChar);
-                        ProgressText = $"{filesDone + 1}/{totalFiles} — {relativePath}";
-
-                        using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-                        writer.WriteFile(currentInode, fileName, fs, fileSize);
-
-                        filesDone++;
-                        bytesDone += fileSize;
-                        double pct = totalSize > 0 ? (double)bytesDone / totalSize * 100 : 0;
-                        ProgressValue = pct;
-
-                        var elapsed = (DateTime.UtcNow - startTime).TotalSeconds;
-                        double speedMBps = elapsed > 0.1 ? (bytesDone / (1024.0 * 1024.0)) / elapsed : 0;
-                        ProgressText = $"{filesDone}/{totalFiles} files  {pct:F1}%  {FormatSize(bytesDone)}/{FormatSize(totalSize)}  {speedMBps:F1} MB/s";
-                    }
-
-                    // 2. Create SUBDIRECTORIES (entries come after files)
-                    foreach (var subDir in Directory.GetDirectories(currentDir))
-                    {
-                        string dirName = Path.GetFileName(subDir);
-                        long dirInode = writer.CreateDirectory(currentInode, dirName);
-                        dirInodes[subDir] = dirInode;
-                        dirsToProcess.Enqueue(subDir);
-                    }
-                }
-                Log($"  Wrote {filesDone} files, created {dirInodes.Count} directories");
-
-                if (!DryRunMode)
-                {
-                    var swFinalize = System.Diagnostics.Stopwatch.StartNew();
-                    writer.UpdateSuperblock();
-                    Log($"  UpdateSuperblock: {swFinalize.ElapsedMilliseconds}ms");
-                    
-                    // Verify CG bitmap consistency
-                    var swVerify = System.Diagnostics.Stopwatch.StartNew();
-                    writer.VerifyCgBitmaps();
-                    Log($"  VerifyCgBitmaps: {swVerify.ElapsedMilliseconds}ms");
-                    
-                    // Verify directory entry DIRSIZ constraints (catches null-terminator padding bugs)
-                    Log("Verifying directory entry DIRSIZ constraints...");
-                    swVerify.Restart();
-                    int dirsizErrors = writer.VerifyDirectoryEntries(rootDirInode, folderName + "/");
-                    Log($"  VerifyDirectoryEntries: {swVerify.ElapsedMilliseconds}ms");
-                    if (dirsizErrors == 0)
-                        Log("  DIRSIZ verification: ALL OK");
-                    else
-                        Log($"  DIRSIZ verification: {dirsizErrors} violations found! Data may not boot on PS3.");
-                    
-                    var totalElapsed = (DateTime.UtcNow - startTime).TotalSeconds;
-                    double avgSpeed = totalElapsed > 0.1 ? (bytesDone / (1024.0 * 1024.0)) / totalElapsed : 0;
-                    Log($"Folder '{folderName}' copied: {filesDone} files, {FormatSize(bytesDone)} in {totalElapsed:F1}s ({avgSpeed:F1} MB/s)");
-                    if (writeDisk != _fileSystem.DiskSource)
-                        writeDisk.Dispose();
-                }
-                else
-                    Log($"[FAKE WRITE TEST] {writer.PendingWrites.Count} writes would be performed. No data written.");
-            });
-
-            ProgressValue = 100;
-            StatusText = DryRunMode
-                ? $"[FAKE WRITE TEST] Would copy '{folderName}' — check log"
-                : $"Folder '{folderName}' copied! ({totalFiles} files, {FormatSize(totalSize)})";
-
-            if (!DryRunMode)
-            {
-                await Task.Run(() =>
-                {
-                    _fileSystem?.Mount();
-                });
-                RefreshFreeSpace();
-                await LoadDirectoryTreeAsync();
-            }
-        }
-        catch (Exception ex)
-        {
-            StatusText = $"Error: {ex.Message}";
-            Log($"ERROR copying folder: {ex.Message}");
-        }
-        finally { IsBusy = false; IsProgressIndeterminate = false; ProgressValue = 0; ProgressText = ""; }
-    }
 
     public async Task DeleteSelectedAsync()
     {
@@ -2631,7 +2380,9 @@ public partial class MainViewModel : ObservableObject
 
     public void Cleanup() => CloseDisk();
 
-    public async Task ExtractPkgAsync(string pkgPath, string outputDir)
+    public Task ExtractPkgAsync(string pkgPath, string outputDir) => ExtractPkgCoreAsync(pkgPath, outputDir, "");
+
+    private async Task<bool> ExtractPkgCoreAsync(string pkgPath, string outputDir, string progressPrefix)
     {
         try
         {
@@ -2660,18 +2411,20 @@ public partial class MainViewModel : ObservableObject
                 extractedDir = pkg.ExtractAll(outputDir, (name, pct) =>
                 {
                     ProgressValue = pct;
-                    ProgressText = $"{pct:F0}%  {name}";
+                    ProgressText = $"{progressPrefix}{pct:F0}%  {name}";
                 });
             });
 
             ProgressValue = 100;
             StatusText = $"PKG extracted to: {extractedDir}";
             Log($"PKG extraction complete: {extractedDir}");
+            return true;
         }
         catch (Exception ex)
         {
             StatusText = $"PKG Error: {ex.Message}";
             Log($"ERROR extracting PKG: {ex.Message}\n{ex.StackTrace}");
+            return false;
         }
         finally { IsBusy = false; IsProgressIndeterminate = false; ProgressValue = 0; ProgressText = ""; }
     }

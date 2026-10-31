@@ -418,12 +418,16 @@
                     <Button Content="Install PKG" Click="OnInstallPkgToHdd"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"
                             ToolTip.Tip="Install a .pkg onto the PS3 drive"/>
-                    <Button Content="Copy file" Click="OnCopyFileToPs3"
+                    <Button Name="CopyToPs3Button" Content="Copy to PS3 ▾"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"
-                            ToolTip.Tip="Copy a file from this computer onto the PS3 drive"/>
-                    <Button Content="Copy folder" Click="OnCopyFolderToPs3"
-                            IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"
-                            ToolTip.Tip="Copy a folder from this computer onto the PS3 drive"/>
+                            ToolTip.Tip="Copy files or folders from this computer into the selected folder (you can pick several)">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="BottomEdgeAlignedLeft">
+                                <MenuItem Header="Files…" Click="OnCopyFilesToPs3"/>
+                                <MenuItem Header="Folders…" Click="OnCopyFoldersToPs3"/>
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
                     <Button Content="New folder" Click="OnCreateDirectory"
                             IsVisible="{Binding !IsPs4}" IsEnabled="{Binding CanWriteFiles}"/>
                     <Border Classes="sep-v"/>
@@ -586,7 +590,7 @@
                                                    FontFamily="Consolas,Menlo,monospace"
                                                    VerticalAlignment="Center" Margin="10,0,0,0"/>
                                     </Grid>
-                                    <Grid ColumnDefinitions="76,*" RowDefinitions="Auto,Auto,Auto,Auto">
+                                    <Grid ColumnDefinitions="76,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto">
                                         <TextBlock Text="Path" FontSize="11" Foreground="#6B675E" Margin="0,3"/>
                                         <TextBlock Grid.Column="1" Text="{Binding SelectedNode.FullPath}"
                                                    FontSize="11" Foreground="#D9A05C" Margin="0,3"
@@ -603,6 +607,16 @@
                                         <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding SelectedNode.Permissions}"
                                                    FontSize="11" Foreground="#D8D4CA" Margin="0,3"
                                                    FontFamily="Consolas,Menlo,monospace"/>
+                                        <TextBlock Grid.Row="4" Text="Total size" FontSize="11" Foreground="#6B675E" Margin="0,3"
+                                                   IsVisible="{Binding IsFolderSelected}"/>
+                                        <TextBlock Grid.Row="4" Grid.Column="1" Name="FolderSizeValue" Text="{Binding FolderSizeText}"
+                                                   FontSize="11" Foreground="#D8D4CA" Margin="0,3" TextWrapping="Wrap"
+                                                   FontFamily="Consolas,Menlo,monospace" IsVisible="{Binding IsFolderSelected}"/>
+                                        <TextBlock Grid.Row="5" Text="Contains" FontSize="11" Foreground="#6B675E" Margin="0,3"
+                                                   IsVisible="{Binding IsFolderSelected}"/>
+                                        <TextBlock Grid.Row="5" Grid.Column="1" Name="FolderContentsValue" Text="{Binding FolderContentsText}"
+                                                   FontSize="11" Foreground="#D8D4CA" Margin="0,3" TextWrapping="Wrap"
+                                                   FontFamily="Consolas,Menlo,monospace" IsVisible="{Binding IsFolderSelected}"/>
                                     </Grid>
                                 </StackPanel>
                             </Border>

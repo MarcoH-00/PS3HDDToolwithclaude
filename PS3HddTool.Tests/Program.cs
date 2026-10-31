@@ -99,6 +99,10 @@ internal static class Program
         Check(fs.Superblock.FreeSpaceBytes == 100 * 4096 + 5 * 512, "Free space parse failed.");
         Check(fs.ReadDirectory(fs.ReadInode(2)).Count == 5, "Directory parse failed.");
         Check(fs.ResolvePath("/folder/hello.txt")?.InodeNumber == 6, "Path resolution failed.");
+        var totals = MainViewModel.ComputeFolderTotals(fs, 5)!;
+        Check(totals.Files == 2 && totals.Folders == 0 && totals.Bytes >= 1537, $"Folder totals wrong: {totals}");
+        var rootTotals = MainViewModel.ComputeFolderTotals(fs, 2)!;
+        Check(rootTotals.Folders == 1 && rootTotals.Files == 4, $"Root totals wrong: {rootTotals}");
         var sparse = fs.ReadInode(3);
         Check(sparse.ModifyTime == 1_600_000_000, "Timestamp parse failed.");
         using var output = new VerifySparseStream(sparse.Size, new()

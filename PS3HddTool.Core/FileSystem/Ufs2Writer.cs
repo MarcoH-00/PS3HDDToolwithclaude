@@ -1808,6 +1808,11 @@ public class Ufs2Writer
         {
             _log($"  ERROR writing '{name}': {ex.Message} — rolling back its allocations");
             RollbackWriteFile(state);
+            // Files queued before this one are complete: link them now so a caller that
+            // stops here (and never reaches UpdateSuperblock) does not leave them allocated
+            // but unreachable.
+            try { CommitPendingLinks(); }
+            catch (Exception commitEx) { _log($"  ERROR linking earlier files: {commitEx.Message}"); }
             throw;
         }
     }
