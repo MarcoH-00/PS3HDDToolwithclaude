@@ -82,25 +82,26 @@ public partial class MainViewModel
     /// Close the drive and ask the operating system to safely remove it from the PC
     /// (Windows "Safely Remove Hardware", Linux udisksctl power-off, macOS diskutil eject).
     /// </summary>
-    public async Task SafelyRemoveDriveAsync()
+    public async Task<PS3HddTool.Core.Disk.DriveEjector.Result?> SafelyRemoveDriveAsync()
     {
-        if (IsBusy) return;
+        if (IsBusy) return null;
         string? path = _physicalDrivePath;
         if (path == null)
         {
             StatusText = "Safe removal is only available for a physical drive.";
-            return;
+            return null;
         }
         try
         {
             IsBusy = true;
-            StatusText = $"Closing {path} and asking the system to remove it...";
+            StatusText = $"Closing {path} and asking the system to remove it — do not unplug yet...";
             try { _diskSource?.Flush(); } catch (Exception ex) { Log($"Flush before removal failed: {ex.Message}"); }
             CloseDisk();
             Log($"Drive closed. Requesting safe removal of {path}...");
             var result = await Task.Run(() => PS3HddTool.Core.Disk.DriveEjector.Eject(path));
-            Log(result.Message);
+            Log((result.Success ? "SAFE TO UNPLUG: " : "NOT SAFE TO UNPLUG: ") + result.Message);
             StatusText = result.Message;
+            return result;
         }
         finally { IsBusy = false; }
     }

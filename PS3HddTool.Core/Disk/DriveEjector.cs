@@ -33,33 +33,73 @@ public static class DriveEjector
 
     private static Result EjectLinux(string devicePath)
     {
-        Run("sync", Array.Empty<string>(), out _);
+        string devName = Path.GetFileName(devicePath);
+        string sysBlock = $"/sys/block/{devName}";
+        if (!Directory.Exists(sysBlock))
+            return new Result(false, $"{devicePath} is not present (no {sysBlock}).");
 
-        // A desktop may have auto-mounted a partition of the drive (the PS3's FAT cache
-        // partition, for example); power-off refuses while anything is mounted.
+        // 1. Nothing in this process may still hold the drive open. A stray handle keeps
+        //    the kernel device alive and lets I/O spin the disk back up after power-off.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        var ownHandles = OwnHandlesTo(devicePath);
+        if (ownHandles.Count > 0)
+            return new Result(false,
+                $"PS3 HDD Tool still has {devicePath} open ({string.Join(", ", ownHandles)}). Nothing was powered off; do not unplug the drive.");
+
+        // 2. Let the kernel finish pending writes and udev finish reacting to the close.
+        Run("sync", Array.Empty<string>(), out _);
+        Run("udevadm", new[] { "settle", "--timeout=10" }, out _, timeoutMs: 15_000);
+        Thread.Sleep(1000);
+
+        // 3. A desktop may have auto-mounted a partition of the drive (the PS3's FAT cache
+        //    partition, for example); power-off refuses while anything is mounted.
         foreach (string part in MountedPartitionsOf(devicePath))
         {
             int urc = Run("udisksctl", new[] { "unmount", "-b", part }, out string uout, timeoutMs: 120_000);
             if (urc != 0)
-                return new Result(false, $"{part} is mounted and could not be unmounted: {Trim(uout)}");
+                return new Result(false, $"{part} is mounted and could not be unmounted: {Trim(uout)}. Do not unplug the drive.");
         }
 
-        // udisks2 powers the drive down so it can be unplugged (USB docks, SATA hot-plug).
-        // Same command as running "udisksctl power-off -b /dev/sdX" by hand: the desktop's
-        // polkit agent can ask for a password, so allow time for that.
+        // 4. Exactly what "udisksctl power-off -b /dev/sdX" does by hand: flush, spin down
+        //    and detach the drive. The desktop's polkit agent may ask for a password.
+        //    There is deliberately no fallback to "eject": it only spins the disk down and
+        //    leaves the device attached and powered, so it can spin back up and be pulled
+        //    while running (the drive's beep on unplug).
         int rc = Run("udisksctl", new[] { "power-off", "-b", devicePath }, out string output, timeoutMs: 120_000);
-        if (rc == 0)
-            return new Result(true, $"{devicePath} was powered off. You can unplug it now.");
+        if (rc != 0)
+            return new Result(false,
+                $"udisksctl power-off failed (exit {rc}): {Trim(output)}. The drive is still connected; do not unplug it. " +
+                $"Close other programs using it and try again, or run: udisksctl power-off -b {devicePath}");
 
-        // Fallback for systems without udisks2 (requires root).
-        string first = output;
-        rc = Run("eject", new[] { devicePath }, out output);
-        if (rc == 0)
-            return new Result(true, $"{devicePath} was ejected. Wait for the drive to spin down before unplugging it.");
+        // 5. Only report success once the kernel has actually dropped the device.
+        for (int i = 0; i < 30 && Directory.Exists(sysBlock); i++)
+            Thread.Sleep(500);
+        if (Directory.Exists(sysBlock))
+            return new Result(false,
+                $"udisksctl reported success but {devicePath} is still attached after 15 s. Wait until it disappears before unplugging.");
 
-        return new Result(false,
-            $"Could not remove {devicePath}. udisksctl: {Trim(first)} | eject: {Trim(output)}. " +
-            "Close any program using the drive, or run: udisksctl power-off -b " + devicePath);
+        return new Result(true, $"{devicePath} was powered off and detached. You can unplug it now.");
+    }
+
+    /// <summary>File descriptors of this process that point at the drive or its partitions.</summary>
+    private static List<string> OwnHandlesTo(string devicePath)
+    {
+        var found = new List<string>();
+        try
+        {
+            foreach (string fd in Directory.EnumerateFileSystemEntries("/proc/self/fd"))
+            {
+                string? target = null;
+                try { target = new FileInfo(fd).LinkTarget; } catch { }
+                if (target == null) continue;
+                string rest = target.StartsWith(devicePath, StringComparison.Ordinal) ? target[devicePath.Length..].TrimStart('p') : "x";
+                if (rest.Length == 0 || rest.All(char.IsDigit))
+                    found.Add($"fd {Path.GetFileName(fd)} → {target}");
+            }
+        }
+        catch { /* /proc not available: cannot check */ }
+        return found;
     }
 
     // ── macOS ────────────────────────────────────────────────────────────────

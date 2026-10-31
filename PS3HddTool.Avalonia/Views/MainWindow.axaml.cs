@@ -210,7 +210,32 @@ public partial class MainWindow : Window
         panel.Children.Add(buttons);
         dialog.Content = panel;
         await dialog.ShowDialog(this);
-        if (confirmed) await _vm.SafelyRemoveDriveAsync();
+        if (!confirmed) return;
+        var result = await _vm.SafelyRemoveDriveAsync();
+        if (result == null) return;
+
+        // Make the outcome impossible to miss: unplugging too early is what hurts the drive.
+        var done = new Window
+        {
+            Title = result.Success ? "Safe to unplug" : "Do NOT unplug yet",
+            Width = 460, Height = 200,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = Wb.WindowBg,
+            Foreground = Wb.Body
+        };
+        var donePanel = new StackPanel { Margin = new global::Avalonia.Thickness(16), Spacing = 12 };
+        donePanel.Children.Add(new TextBlock
+        {
+            Text = (result.Success ? "✔ " : "✖ ") + result.Message,
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
+            Foreground = global::Avalonia.Media.Brush.Parse(result.Success ? "#5FB86A" : "#F07070")
+        });
+        var ok = new Button { Content = "OK", HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right };
+        ok.Click += (_, _) => done.Close();
+        donePanel.Children.Add(ok);
+        done.Content = donePanel;
+        await done.ShowDialog(this);
     }
 
     private async void OnPaste(object? sender, RoutedEventArgs e) => await _vm.PasteAsync();
