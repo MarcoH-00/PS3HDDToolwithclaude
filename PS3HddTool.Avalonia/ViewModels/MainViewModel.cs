@@ -1231,6 +1231,67 @@ public partial class MainViewModel : ObservableObject
         if (IsPs4) { await LoadPs4RootAsync(); return; }
         if (_fileSystem == null) return;
 
+        // Remember which folders were open and what was selected, so a reload after a
+        // write does not collapse the tree back to the root.
+        var expandedPaths = new List<string>();
+        void CollectExpanded(IEnumerable<FileTreeNode> nodes)
+        {
+            foreach (var n in nodes)
+            {
+                if (!n.IsDirectory || !n.IsExpanded || !n.IsSelectable) continue;
+                expandedPaths.Add(n.FullPath);
+                CollectExpanded(n.Children);
+            }
+        }
+        CollectExpanded(FileTree);
+        string? selectedPath = SelectedNode?.FullPath;
+
+        await LoadRootEntriesAsync();
+        await RestoreTreeStateAsync(expandedPaths, selectedPath);
+    }
+
+    private async Task RestoreTreeStateAsync(List<string> expandedPaths, string? selectedPath)
+    {
+        FileTreeNode? Find(string path)
+        {
+            IEnumerable<FileTreeNode> level = FileTree;
+            FileTreeNode? found = null;
+            string acc = "";
+            foreach (string part in path.Split('/', StringSplitOptions.RemoveEmptyEntries))
+            {
+                acc += "/" + part;
+                found = level.FirstOrDefault(n => n.FullPath == acc);
+                if (found == null) return null;
+                level = found.Children;
+            }
+            return found;
+        }
+
+        foreach (string path in expandedPaths.OrderBy(p => p.Count(c => c == '/')))
+        {
+            var node = Find(path);
+            if (node == null) continue;
+            if (!node.ChildrenLoaded) await ExpandNodeAsync(node);
+            node.IsExpanded = true;
+        }
+
+        if (selectedPath != null)
+        {
+            // Select the same item, or the nearest folder that still exists.
+            string? probe = selectedPath;
+            FileTreeNode? target = null;
+            while (!string.IsNullOrEmpty(probe) && probe != "/" && (target = Find(probe)) == null)
+            {
+                int slash = probe.LastIndexOf('/');
+                probe = slash <= 0 ? null : probe[..slash];
+            }
+            SelectedNode = target;
+        }
+    }
+
+    private async Task LoadRootEntriesAsync()
+    {
+        if (_fileSystem == null) return;
         try
         {
             List<FileTreeNode> rootChildren = new();
@@ -1239,8 +1300,11 @@ public partial class MainViewModel : ObservableObject
             {
                 var rootInode = _fileSystem.ReadInode(2);
                 var entries = _fileSystem.ReadDirectory(rootInode);
+                bool verbose = VerboseDiagnostics;
 
                 // Dump root inode
+                if (verbose)
+                {
                 Log($"=== ROOT INODE DUMP ===");
                 if (rootInode.RawBytes != null)
                 {
@@ -1254,6 +1318,7 @@ public partial class MainViewModel : ObservableObject
                 Log($"=== ROOT DIR DATA ({rootDirData.Length} bytes) ===");
                 for (int r = 0; r < Math.Min(512, rootDirData.Length); r += 32)
                     Log($"  0x{r:X2}: {BitConverter.ToString(rootDirData, r, Math.Min(32, rootDirData.Length - r))}");
+                }
 
                 foreach (var entry in entries)
                 {
@@ -1265,6 +1330,7 @@ public partial class MainViewModel : ObservableObject
                         var node = FileTreeNode.FromInode(inode, entry.Name, "/", 2);
                         rootChildren.Add(node);
 
+                        if (!verbose) continue;
                         // Log inode details for every root child
                         uint rootChildBlksize = inode.RawBytes != null && inode.RawBytes.Length >= 16
                             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(inode.RawBytes.AsSpan(0x0C)) : 0;
@@ -1754,12 +1820,16 @@ public partial class MainViewModel : ObservableObject
                     var childInode = _fileSystem.ReadInode(entry.InodeNumber);
                     var childNode = FileTreeNode.FromInode(childInode, entry.Name, node.FullPath, node.InodeNumber);
                     
-                    // Log inode details for diagnostics
-                    uint diBlksize = childInode.RawBytes != null && childInode.RawBytes.Length >= 16 
-                        ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(childInode.RawBytes.AsSpan(0x0C)) : 0;
-                    Log($"  [{entry.Name}] inode={entry.InodeNumber} mode=0x{childInode.Mode:X4} nlink={childInode.LinkCount} size={childInode.Size} uid={childInode.Uid} gid={childInode.Gid} flags=0x{childInode.Flags:X8} blksize={diBlksize}");
-                    if (childInode.RawBytes != null && childInode.RawBytes.Length >= 32)
-                        Log($"    raw: {BitConverter.ToString(childInode.RawBytes, 0, 32)}");
+                    // Log inode details for diagnostics (one line per entry: only in verbose mode,
+                    // since it made expanding large folders slow and buried the useful log lines)
+                    if (VerboseDiagnostics)
+                    {
+                        uint diBlksize = childInode.RawBytes != null && childInode.RawBytes.Length >= 16
+                            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(childInode.RawBytes.AsSpan(0x0C)) : 0;
+                        Log($"  [{entry.Name}] inode={entry.InodeNumber} mode=0x{childInode.Mode:X4} nlink={childInode.LinkCount} size={childInode.Size} uid={childInode.Uid} gid={childInode.Gid} flags=0x{childInode.Flags:X8} blksize={diBlksize}");
+                        if (childInode.RawBytes != null && childInode.RawBytes.Length >= 32)
+                            Log($"    raw: {BitConverter.ToString(childInode.RawBytes, 0, 32)}");
+                    }
                     
                     // Deep recursive dump for game title directories (NPUB*, NPEA*, BLUS*, BLES*, etc.)
                     if (VerboseDiagnostics && childNode.IsDirectory && node.Name == "game")
@@ -1926,14 +1996,21 @@ public partial class MainViewModel : ObservableObject
         if (dispatcher.CheckAccess()) AddLogLine(timestamped);
         else dispatcher.Post(() => AddLogLine(timestamped));
 
-        try
+        // One writer kept open instead of opening and closing the file for every line.
+        lock (LogFileLock)
         {
-            File.AppendAllText(LogFilePath, timestamped + Environment.NewLine);
+            try
+            {
+                _logFile ??= new StreamWriter(new FileStream(LogFilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+                _logFile.WriteLine(timestamped);
+            }
+            catch { /* Don't crash if log file can't be written */ }
         }
-        catch { /* Don't crash if log file can't be written */ }
     }
 
     private const int MaxLogLines = 5000;
+    private static readonly object LogFileLock = new();
+    private static StreamWriter? _logFile;
 
     private void AddLogLine(string line)
     {

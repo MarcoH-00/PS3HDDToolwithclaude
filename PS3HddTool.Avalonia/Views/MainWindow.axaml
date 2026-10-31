@@ -489,6 +489,11 @@
                                   SelectedItem="{Binding SelectedNode}"
                                   Name="FileTreeView" Margin="4" IsEnabled="{Binding !IsBusy}"
                                   DragDrop.AllowDrop="True">
+                            <TreeView.Styles>
+                                <Style Selector="TreeViewItem">
+                                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+                                </Style>
+                            </TreeView.Styles>
                             <TreeView.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="Extract…" Click="OnExtract"
