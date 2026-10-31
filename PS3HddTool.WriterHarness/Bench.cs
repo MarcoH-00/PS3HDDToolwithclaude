@@ -154,7 +154,7 @@ internal static class Bench
     private static void Report(string name, TimeSpan elapsed, CountingDiskSource? c)
     {
         string io = c == null ? "" :
-            $" | reads {c.Reads} ({c.ReadBytes / 1048576.0:F1} MiB) | writes {c.Writes} ({c.WriteBytes / 1048576.0:F1} MiB) | flushes {c.Flushes}";
+            $" | reads {c.Reads} ({c.BytesRead / 1048576.0:F1} MiB) | writes {c.Writes} ({c.BytesWritten / 1048576.0:F1} MiB) | flushes {c.Flushes}";
         Console.WriteLine($"::notice title=bench::{name}: {elapsed.TotalMilliseconds:F0} ms{io}");
     }
 
@@ -197,8 +197,8 @@ internal static class Bench
 /// <summary>Counts physical I/O issued to the wrapped source.</summary>
 internal sealed class CountingDiskSource(IDiskSource inner) : IDiskSource
 {
-    public long Reads, ReadBytes, Writes, WriteBytes, Flushes;
-    public void Reset() { Reads = ReadBytes = Writes = WriteBytes = Flushes = 0; }
+    public long Reads, BytesRead, Writes, BytesWritten, Flushes;
+    public void Reset() { Reads = BytesRead = Writes = BytesWritten = Flushes = 0; }
 
     public long TotalSize => inner.TotalSize;
     public int SectorSize => inner.SectorSize;
@@ -208,19 +208,19 @@ internal sealed class CountingDiskSource(IDiskSource inner) : IDiskSource
 
     public byte[] ReadSectors(long startSector, int count)
     {
-        Interlocked.Increment(ref Reads); Interlocked.Add(ref ReadBytes, (long)count * 512);
+        Interlocked.Increment(ref Reads); Interlocked.Add(ref BytesRead, (long)count * 512);
         return inner.ReadSectors(startSector, count);
     }
     public byte[] ReadBytes(long offset, int count)
     {
-        Interlocked.Increment(ref Reads); Interlocked.Add(ref ReadBytes, count);
+        Interlocked.Increment(ref Reads); Interlocked.Add(ref BytesRead, count);
         return inner.ReadBytes(offset, count);
     }
     public void WriteSectors(long startSector, byte[] data) => WriteBytes(startSector * 512, (ReadOnlySpan<byte>)data);
     public void WriteBytes(long offset, byte[] data) => WriteBytes(offset, (ReadOnlySpan<byte>)data);
     public void WriteBytes(long offset, ReadOnlySpan<byte> data)
     {
-        Interlocked.Increment(ref Writes); Interlocked.Add(ref WriteBytes, data.Length);
+        Interlocked.Increment(ref Writes); Interlocked.Add(ref BytesWritten, data.Length);
         inner.WriteBytes(offset, data);
     }
     public void Flush() { Interlocked.Increment(ref Flushes); inner.Flush(); }
