@@ -1227,7 +1227,10 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// Load the root directory into the tree view.
     /// </summary>
-    private async Task LoadDirectoryTreeAsync()
+    private async Task LoadDirectoryTreeAsync() => await LoadDirectoryTreeAsync(null);
+
+    /// <param name="remapPath">Maps remembered paths to their new location (after a rename).</param>
+    private async Task LoadDirectoryTreeAsync(Func<string, string>? remapPath)
     {
         if (IsPs4) { await LoadPs4RootAsync(); return; }
         if (_fileSystem == null) return;
@@ -1246,6 +1249,11 @@ public partial class MainViewModel : ObservableObject
         }
         CollectExpanded(FileTree);
         string? selectedPath = SelectedNode?.FullPath;
+        if (remapPath != null)
+        {
+            expandedPaths = expandedPaths.Select(remapPath).ToList();
+            if (selectedPath != null) selectedPath = remapPath(selectedPath);
+        }
 
         await LoadRootEntriesAsync();
         await RestoreTreeStateAsync(expandedPaths, selectedPath);
@@ -2055,6 +2063,18 @@ public partial class MainViewModel : ObservableObject
         ImagePreview = null;
     }
 
+    /// <summary>Clear the selection, re-read the root folder from disk and collapse every folder.</summary>
+    public async Task GoToRootAsync()
+    {
+        if (IsBusy || !IsFilesystemMounted) return;
+        DeselectNode();
+        if (IsPs4) { await LoadPs4RootAsync(); return; }
+        await Task.Run(() => _fileSystem?.Mount());
+        RefreshFreeSpace();
+        await LoadRootEntriesAsync();
+        RefreshCheckedCount();
+    }
+
     private static long ReadBE64(byte[] data, int offset)
     {
         return ((long)data[offset] << 56) | ((long)data[offset + 1] << 48) |
@@ -2349,8 +2369,15 @@ public partial class MainViewModel : ObservableObject
 
             if (!DryRunMode)
             {
-                SelectedNode.Name = newName;
-                SelectedNode.FullPath = SelectedNode.FullPath.Replace($"/{oldName}", $"/{newName}");
+                // Reload the tree from disk so the new name shows, keeping open folders and
+                // the selection (paths under a renamed folder are mapped to the new name).
+                string oldPath = SelectedNode.FullPath;
+                int slash = oldPath.LastIndexOf('/');
+                string newPath = (slash <= 0 ? "" : oldPath[..slash]) + "/" + newName;
+                string Remap(string p) =>
+                    p == oldPath ? newPath :
+                    p.StartsWith(oldPath + "/", StringComparison.Ordinal) ? newPath + p[oldPath.Length..] : p;
+                await LoadDirectoryTreeAsync(Remap);
             }
 
             StatusText = DryRunMode ? $"[DRY RUN] Would rename to '{newName}'" : $"Renamed to '{newName}'";
@@ -2432,10 +2459,34 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// Extract a PKG and install it directly to game/{TITLE_ID}/ on the PS3 HDD.
     /// </summary>
-    public async Task InstallPkgToHddAsync(string pkgPath)
+    public async Task InstallPkgToHddAsync(string pkgPath) => await InstallPkgCoreAsync(pkgPath, "");
+
+    /// <summary>
+    /// Install several PKGs one after another (a game, its updates and DLC). Packages for a
+    /// title that is already installed are merged into game/&lt;TITLE_ID&gt;, replacing files
+    /// with the same name, so updates can be installed after the base game.
+    /// </summary>
+    public async Task InstallPkgsToHddAsync(IReadOnlyList<string> pkgPaths)
     {
-        if (RejectPs4Write() || IsBusy) return;
-        if (_fileSystem == null) return;
+        if (RejectPs4Write() || IsBusy || pkgPaths.Count == 0) return;
+        int ok = 0;
+        for (int i = 0; i < pkgPaths.Count; i++)
+        {
+            string prefix = pkgPaths.Count > 1 ? $"PKG {i + 1}/{pkgPaths.Count}  " : "";
+            if (await InstallPkgCoreAsync(pkgPaths[i], prefix)) ok++;
+            else if (pkgPaths.Count > 1) Log($"Continuing with the next PKG after an error in {Path.GetFileName(pkgPaths[i])}.");
+        }
+        if (pkgPaths.Count > 1)
+            StatusText = ok == pkgPaths.Count
+                ? $"Installed {ok} PKGs"
+                : $"Installed {ok} of {pkgPaths.Count} PKGs — see the log";
+    }
+
+    private async Task<bool> InstallPkgCoreAsync(string pkgPath, string progressPrefix)
+    {
+        if (RejectPs4Write() || IsBusy) return false;
+        if (_fileSystem == null) return false;
+        bool installed = false;
 
         string? tempDir = null;
         try
@@ -2468,14 +2519,14 @@ public partial class MainViewModel : ObservableObject
                 extractedDir = pkg.ExtractAll(tempDir, (name, pct) =>
                 {
                     ProgressValue = pct * 0.4; // 0-40% for extraction
-                    ProgressText = $"Extracting: {pct:F0}%  {name}";
+                    ProgressText = $"{progressPrefix}Extracting: {pct:F0}%  {name}";
                 });
             });
 
             if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(extractedDir))
             {
                 StatusText = "PKG extraction failed — no Title ID found.";
-                return;
+                return false;
             }
 
             // Step 2: Find or create game/ directory
@@ -2509,13 +2560,24 @@ public partial class MainViewModel : ObservableObject
                     Log($"  Found game/ at inode {gameInodeNumber}");
                 }
 
-                // Check if title already exists
-                if (writer.DirectoryContainsEntry(gameInodeNumber, titleId))
+                // Find an entry by name on disk (folders created by this writer are written
+                // immediately, so they are visible here too).
+                Ufs2DirectoryEntry? FindEntry(long dirInode, string entryName) =>
+                    writeFs.ReadDirectory(writeFs.ReadInode(dirInode)).FirstOrDefault(e => e.Name == entryName);
+
+                long EnsureDirectory(long parent, string dirName)
                 {
-                    Log($"  WARNING: game/{titleId} already exists — writing over it.");
+                    var existing = FindEntry(parent, dirName);
+                    if (existing == null) return writer.CreateDirectory(parent, dirName);
+                    if (writeFs.ReadInode(existing.InodeNumber).FileType != Ufs2FileType.Directory)
+                        throw new IOException($"'{dirName}' already exists as a file; cannot merge the package into it.");
+                    return existing.InodeNumber;
                 }
 
-                // Copy extracted folder into game/
+                bool merging = FindEntry(gameInodeNumber, titleId) != null;
+                if (merging)
+                    Log($"  game/{titleId} already exists — merging (files with the same name are replaced).");
+
                 var allFiles = Directory.GetFiles(extractedDir, "*", SearchOption.AllDirectories);
                 long totalSize = allFiles.Sum(f => new FileInfo(f).Length);
                 int totalFiles = allFiles.Length;
@@ -2524,29 +2586,21 @@ public partial class MainViewModel : ObservableObject
                 Log($"  Writing {totalFiles} files, {allDirs.Length} subdirs, {FormatSize(totalSize)}");
 
                 var dirInodes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-
-                // Create title directory
-                long titleDirInode = writer.CreateDirectory(gameInodeNumber, titleId);
+                long titleDirInode = EnsureDirectory(gameInodeNumber, titleId);
                 dirInodes[extractedDir] = titleDirInode;
 
-                // Create subdirectories first
                 foreach (string dir in allDirs.OrderBy(d => d.Length))
                 {
                     string parentDir = Path.GetDirectoryName(dir)!;
-                    string dirName = Path.GetFileName(dir);
-
                     if (!dirInodes.TryGetValue(parentDir, out long parentInode))
                     {
                         Log($"  WARNING: parent directory not found for {dir}");
                         continue;
                     }
-
-                    long dirInode = writer.CreateDirectory(parentInode, dirName);
-                    dirInodes[dir] = dirInode;
+                    dirInodes[dir] = EnsureDirectory(parentInode, Path.GetFileName(dir));
                 }
 
-                // Write files
-                int filesDone = 0;
+                int filesDone = 0, replaced = 0;
                 long bytesDone = 0;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -2554,22 +2608,34 @@ public partial class MainViewModel : ObservableObject
                 {
                     string parentDir = Path.GetDirectoryName(file)!;
                     string fileName = Path.GetFileName(file);
-
                     if (!dirInodes.TryGetValue(parentDir, out long parentInode))
                         parentInode = titleDirInode;
+
+                    if (merging)
+                    {
+                        var old = FindEntry(parentInode, fileName);
+                        if (old != null)
+                        {
+                            if (writeFs.ReadInode(old.InodeNumber).FileType == Ufs2FileType.Directory)
+                                throw new IOException($"'{fileName}' exists as a folder; cannot replace it with a file.");
+                            writer.DeleteFile(parentInode, fileName, old.InodeNumber);
+                            replaced++;
+                        }
+                    }
 
                     using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
                     writer.WriteFile(parentInode, fileName, fs, fs.Length);
 
                     filesDone++;
-                    bytesDone += new FileInfo(file).Length;
+                    bytesDone += fs.Length;
 
-                    double pct = 40 + (double)filesDone / totalFiles * 55; // 40-95%
+                    double pct = 40 + (double)filesDone / Math.Max(1, totalFiles) * 55; // 40-95%
                     ProgressValue = pct;
                     double speedMBps = sw.Elapsed.TotalSeconds > 0.1
                         ? (bytesDone / (1024.0 * 1024.0)) / sw.Elapsed.TotalSeconds : 0;
-                    ProgressText = $"{pct:F0}%  {filesDone}/{totalFiles} files  {speedMBps:F1} MB/s";
+                    ProgressText = $"{progressPrefix}{pct:F0}%  {filesDone}/{totalFiles} files  {speedMBps:F1} MB/s";
                 }
+                if (replaced > 0) Log($"  Replaced {replaced} existing file(s) in game/{titleId}");
 
                 writer.UpdateSuperblock();
             });
@@ -2581,6 +2647,7 @@ public partial class MainViewModel : ObservableObject
 
             // Refresh tree
             await LoadDirectoryTreeAsync();
+            installed = true;
         }
         catch (Exception ex)
         {
@@ -2601,5 +2668,6 @@ public partial class MainViewModel : ObservableObject
                 catch { }
             }
         }
+        return installed;
     }
 }

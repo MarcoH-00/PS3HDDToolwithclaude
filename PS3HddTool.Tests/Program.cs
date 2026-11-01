@@ -254,6 +254,13 @@ internal static class Program
             await vm.DecryptAsync();
             Check(!vm.IsPs4 && vm.IsFilesystemMounted && vm.CanWriteFiles && vm.Ps4Partitions.Count == 0,
                 "PS4-to-PS3 switching regression: " + vm.StatusText);
+            var ps3Folder = vm.FileTree.Single(n => n.Name == "folder");
+            await vm.ExpandNodeAsync(ps3Folder);
+            ps3Folder.IsExpanded = true;
+            vm.SelectedNode = ps3Folder.Children.First();
+            await vm.GoToRootAsync();
+            Check(vm.SelectedNode == null && vm.FileTree.Count > 0 && vm.FileTree.All(n => !n.IsExpanded),
+                "Root did not reload and collapse the tree.");
             await vm.OpenImageAsync(Path.Combine(Output, "missing.img"));
             Check(!vm.IsDiskOpen && !vm.IsFilesystemMounted && !vm.IsPs4, "Failed open retained stale state.");
             await vm.OpenImageAsync(path); vm.ImportPs4Key(Fixtures.Key); await vm.DecryptAsync();

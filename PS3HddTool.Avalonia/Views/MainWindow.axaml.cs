@@ -497,9 +497,9 @@ public partial class MainWindow : Window
         if (_vm.IsFilesystemMounted)
         {
             // Check for PKG files
-            if (paths.Count == 1 && firstExt == ".pkg")
+            if (paths.All(p => File.Exists(p) && Path.GetExtension(p).Equals(".pkg", StringComparison.OrdinalIgnoreCase)))
             {
-                await _vm.InstallPkgToHddAsync(paths[0]);
+                await _vm.InstallPkgsToHddAsync(paths);
                 return;
             }
 
@@ -1444,12 +1444,12 @@ public partial class MainWindow : Window
             await _vm.CopyItemsToPs3Async(paths);
     }
 
-    private void OnGoToRoot(object? sender, RoutedEventArgs e)
+    private async void OnGoToRoot(object? sender, RoutedEventArgs e)
     {
-        _vm.DeselectNode();
         var tree = this.FindControl<TreeView>("FileTreeView");
-        if (tree != null)
-            tree.UnselectAll();
+        tree?.UnselectAll();
+        await _vm.GoToRootAsync();
+        tree?.UnselectAll();
     }
 
     private async void OnInstallPkgToHdd(object? sender, RoutedEventArgs e)
@@ -1457,21 +1457,17 @@ public partial class MainWindow : Window
         if (!_vm.CanWriteFiles) return;
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
-            Title = "Select PKG to install to PS3 HDD",
-            AllowMultiple = false,
+            Title = "Select PKG files to install to PS3 HDD",
+            AllowMultiple = true,
             FileTypeFilter = new[]
             {
                 new FilePickerFileType("PS3 Package Files") { Patterns = new[] { "*.pkg" } },
                 new FilePickerFileType("All Files") { Patterns = new[] { "*" } }
             }
         });
-
-        if (files.Count > 0)
-        {
-            string? path = files[0].TryGetLocalPath();
-            if (path != null)
-                await _vm.InstallPkgToHddAsync(path);
-        }
+        var paths = files.Select(f => f.TryGetLocalPath()).OfType<string>().ToList();
+        if (paths.Count > 0)
+            await _vm.InstallPkgsToHddAsync(paths);
     }
 
     private async void OnDeleteSelected(object? sender, RoutedEventArgs e)
