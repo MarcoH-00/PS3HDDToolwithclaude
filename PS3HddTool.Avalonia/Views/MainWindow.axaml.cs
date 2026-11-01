@@ -497,9 +497,9 @@ public partial class MainWindow : Window
         if (_vm.IsFilesystemMounted)
         {
             // Check for PKG files
-            if (paths.Count == 1 && firstExt == ".pkg")
+            if (paths.All(p => File.Exists(p) && Path.GetExtension(p).Equals(".pkg", StringComparison.OrdinalIgnoreCase)))
             {
-                await _vm.InstallPkgToHddAsync(paths[0]);
+                await _vm.InstallPkgsToHddAsync(paths);
                 return;
             }
 
@@ -512,24 +512,19 @@ public partial class MainWindow : Window
                 targetName = _vm.SelectedNode.FullPath;
             }
 
+            var usable = new List<string>();
             foreach (string path in paths)
             {
-                if (Directory.Exists(path))
-                {
-                    _vm.Log($"Drag-drop folder: {path} → {targetName}");
-                    await _vm.CopyFolderToPs3WithPath(path);
-                }
-                else if (File.Exists(path))
-                {
-                    _vm.Log($"Drag-drop file: {path} → {targetName}");
-                    await _vm.CopyFileToPs3WithPath(path);
-                }
-                else
-                {
-                    _vm.StatusText = $"Path not accessible: {path}";
-                    _vm.Log($"Drag-drop: path not accessible (may be a permissions issue): {path}");
-                }
+                if (Directory.Exists(path) || File.Exists(path)) usable.Add(path);
+                else _vm.Log($"Drag-drop: path not accessible (may be a permissions issue): {path}");
             }
+            if (usable.Count == 0)
+            {
+                _vm.StatusText = "None of the dropped items can be read.";
+                return;
+            }
+            _vm.Log($"Drag-drop: copying {usable.Count} item(s) → {targetName}");
+            await _vm.CopyItemsToPs3Async(usable);
         }
         else
         {
@@ -1419,50 +1414,42 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void OnCopyFileToPs3(object? sender, RoutedEventArgs e)
+    private async void OnCopyFilesToPs3(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanWriteFiles) return;
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
-            Title = "Select file to copy to PS3",
-            AllowMultiple = false,
+            Title = "Select files to copy to PS3",
+            AllowMultiple = true,
             FileTypeFilter = new[]
             {
                 new FilePickerFileType("All Files") { Patterns = new[] { "*" } }
             }
         });
-
-        if (files.Count > 0)
-        {
-            string? path = files[0].TryGetLocalPath();
-            if (path != null)
-                await _vm.CopyFileToPs3WithPath(path);
-        }
+        var paths = files.Select(f => f.TryGetLocalPath()).OfType<string>().ToList();
+        if (paths.Count > 0)
+            await _vm.CopyItemsToPs3Async(paths);
     }
 
-    private async void OnCopyFolderToPs3(object? sender, RoutedEventArgs e)
+    private async void OnCopyFoldersToPs3(object? sender, RoutedEventArgs e)
     {
         if (!_vm.CanWriteFiles) return;
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
-            Title = "Select folder to copy to PS3",
-            AllowMultiple = false
+            Title = "Select folders to copy to PS3",
+            AllowMultiple = true
         });
-
-        if (folders.Count > 0)
-        {
-            string? path = folders[0].TryGetLocalPath();
-            if (path != null)
-                await _vm.CopyFolderToPs3WithPath(path);
-        }
+        var paths = folders.Select(f => f.TryGetLocalPath()).OfType<string>().ToList();
+        if (paths.Count > 0)
+            await _vm.CopyItemsToPs3Async(paths);
     }
 
-    private void OnGoToRoot(object? sender, RoutedEventArgs e)
+    private async void OnGoToRoot(object? sender, RoutedEventArgs e)
     {
-        _vm.DeselectNode();
         var tree = this.FindControl<TreeView>("FileTreeView");
-        if (tree != null)
-            tree.UnselectAll();
+        tree?.UnselectAll();
+        await _vm.GoToRootAsync();
+        tree?.UnselectAll();
     }
 
     private async void OnInstallPkgToHdd(object? sender, RoutedEventArgs e)
@@ -1470,21 +1457,17 @@ public partial class MainWindow : Window
         if (!_vm.CanWriteFiles) return;
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
-            Title = "Select PKG to install to PS3 HDD",
-            AllowMultiple = false,
+            Title = "Select PKG files to install to PS3 HDD",
+            AllowMultiple = true,
             FileTypeFilter = new[]
             {
                 new FilePickerFileType("PS3 Package Files") { Patterns = new[] { "*.pkg" } },
                 new FilePickerFileType("All Files") { Patterns = new[] { "*" } }
             }
         });
-
-        if (files.Count > 0)
-        {
-            string? path = files[0].TryGetLocalPath();
-            if (path != null)
-                await _vm.InstallPkgToHddAsync(path);
-        }
+        var paths = files.Select(f => f.TryGetLocalPath()).OfType<string>().ToList();
+        if (paths.Count > 0)
+            await _vm.InstallPkgsToHddAsync(paths);
     }
 
     private async void OnDeleteSelected(object? sender, RoutedEventArgs e)
@@ -1714,11 +1697,11 @@ public partial class MainWindow : Window
         var vm = DataContext as MainViewModel;
         if (vm == null) return;
 
-        // Pick PKG file
+        // Pick one or more PKG files
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
-            Title = "Select PS3 PKG File",
-            AllowMultiple = false,
+            Title = "Select PS3 PKG files",
+            AllowMultiple = true,
             FileTypeFilter = new[]
             {
                 new FilePickerFileType("PS3 PKG") { Patterns = new[] { "*.pkg" } },
@@ -1727,7 +1710,7 @@ public partial class MainWindow : Window
         });
 
         if (files == null || files.Count == 0) return;
-        string pkgPath = files[0].Path.LocalPath;
+        var pkgPaths = files.Select(f => f.TryGetLocalPath() ?? f.Path.LocalPath).ToList();
 
         // Pick output directory
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
@@ -1739,7 +1722,7 @@ public partial class MainWindow : Window
         if (folders == null || folders.Count == 0) return;
         string outputDir = folders[0].Path.LocalPath;
 
-        await vm.ExtractPkgAsync(pkgPath, outputDir);
+        await vm.ExtractPkgsAsync(pkgPaths, outputDir);
     }
 
     private void OnEject(object? sender, RoutedEventArgs e) => _vm.Eject();

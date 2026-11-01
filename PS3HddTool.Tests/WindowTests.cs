@@ -64,9 +64,9 @@ internal static class WindowTests
                 await vm.DecryptAsync();
                 Check(vm.IsFilesystemMounted, vm.StatusText);
                 CheckScreen(true);
-                foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG", "Extract PKG", "Saved keys", "Export", "Save" })
+                foreach (string label in new[] { "New folder", "Copy to PS3 ▾", "Install PKG", "Extract PKG", "Saved keys", "Export", "Save" })
                     Check(!Button(label).IsEnabled, $"PS4 window enables {label}.");
-                foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG", "Cut", "Paste" })
+                foreach (string label in new[] { "New folder", "Copy to PS3 ▾", "Install PKG", "Cut", "Paste" })
                     Check(!Button(label).IsVisible, $"PS4 window shows {label}.");
                 var combo = Find<ComboBox>("Ps4PartitionPicker");
                 Check(Equals(combo.SelectedItem, vm.SelectedPs4Partition), "Partition selection binding failed.");
@@ -133,7 +133,7 @@ internal static class WindowTests
                 CheckScreen(true);
                 vm.SelectedNode = vm.FileTree.First();
                 Dispatcher.UIThread.RunJobs();
-                foreach (string label in new[] { "New folder", "Copy file", "Copy folder", "Install PKG" })
+                foreach (string label in new[] { "New folder", "Copy to PS3 ▾", "Install PKG" })
                     Check(Button(label).IsVisible && Button(label).IsEnabled, $"PS3 action {label} unavailable.");
                 menu.Open(Find<TreeView>("FileTreeView"));
                 Dispatcher.UIThread.RunJobs();

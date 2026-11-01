@@ -35,6 +35,7 @@ public class Ufs2FileSystem
     /// </summary>
     public bool Mount()
     {
+        InvalidateCache();
         byte[] sbData = _disk.ReadBytes(_partitionOffsetBytes + 65536, 8192);
         RawSuperblockData = sbData;
         Superblock = Ufs2Superblock.Parse(sbData);
@@ -42,6 +43,12 @@ public class Ufs2FileSystem
         Superblock.ValidateGeometry(_disk.TotalSize - _partitionOffsetBytes);
         return true;
     }
+
+    /// <summary>
+    /// True once a writer has recomputed the summary table from every cylinder group in
+    /// this session, so later superblock updates can be incremental.
+    /// </summary>
+    public bool SummaryVerified { get; set; }
 
     /// <summary>Raw superblock bytes for debugging.</summary>
     public byte[]? RawSuperblockData { get; private set; }
@@ -65,7 +72,7 @@ public class Ufs2FileSystem
         if (inodeOffset > _disk.TotalSize - Superblock.InodeSize)
             throw new InvalidDataException("Inode extends past the source.");
 
-        byte[] inodeData = _disk.ReadBytes(inodeOffset, (int)Superblock.InodeSize);
+        byte[] inodeData = ReadCached(inodeOffset, (int)Superblock.InodeSize);
         return Ufs2Inode.Parse(inodeData, inodeNumber, Superblock.IsLittleEndian);
     }
 
@@ -215,7 +222,140 @@ public class Ufs2FileSystem
         long offset = _partitionOffsetBytes + fragment * Superblock.FragmentSize;
         if (offset > _disk.TotalSize - count)
             throw new InvalidDataException("UFS2 block extends past the source.");
-        return _disk.ReadBytes(offset, count);
+        return ReadCached(offset, count);
+    }
+
+    // ── metadata page cache ─────────────────────────────────────────────────
+    // Listing a folder used to read (and decrypt) one 512-byte sector per entry, and every
+    // directory or indirect block again on each visit. Small reads now go through an LRU
+    // cache of 16 KiB pages: one inode block read serves 64 inodes. Large reads (file data
+    // during extraction) bypass it. Ufs2Writer calls InvalidateCache after every write, and
+    // a generation counter keeps a read that raced with a write from caching stale bytes.
+
+    private const int CachePageSize = 16 * 1024;
+    private const int CacheMaxPages = 2048;          // 32 MiB
+    private const int CacheBypassBytes = 4 * CachePageSize;
+    private readonly object _cacheLock = new();
+    private readonly Dictionary<long, LinkedListNode<(long Page, byte[] Data)>> _cachePages = new();
+    private readonly LinkedList<(long Page, byte[] Data)> _cacheLru = new();
+    private long _cacheGeneration;
+
+    /// <summary>Statistics for diagnostics and benchmarks.</summary>
+    public long CacheHits { get; private set; }
+    public long CacheMisses { get; private set; }
+
+    /// <summary>Drop every cached page. Must be called after anything writes to the disk.</summary>
+    public void InvalidateCache()
+    {
+        lock (_cacheLock)
+        {
+            _cachePages.Clear();
+            _cacheLru.Clear();
+            _cacheGeneration++;
+        }
+    }
+
+    /// <summary>Drop cached pages overlapping a written byte range.</summary>
+    public void InvalidateRange(long offset, long length)
+    {
+        if (length <= 0) return;
+        long first = offset / CachePageSize;
+        long last = (offset + length - 1) / CachePageSize;
+        lock (_cacheLock)
+        {
+            _cacheGeneration++;
+            if (last - first + 1 > _cachePages.Count)
+            {
+                foreach (long page in _cachePages.Keys.Where(p => p >= first && p <= last).ToList())
+                {
+                    _cacheLru.Remove(_cachePages[page]);
+                    _cachePages.Remove(page);
+                }
+            }
+            else
+            {
+                for (long page = first; page <= last; page++)
+                {
+                    if (_cachePages.Remove(page, out var node)) _cacheLru.Remove(node);
+                }
+            }
+        }
+    }
+
+    /// <summary>Cached read of a small metadata range (directory, inode or indirect blocks).</summary>
+    public byte[] ReadMetadata(long offset, int count) => ReadCached(offset, count);
+
+    private byte[] ReadCached(long offset, int count)
+    {
+        if (count <= 0) return Array.Empty<byte>();
+        if (count > CacheBypassBytes) return _disk.ReadBytes(offset, count);
+
+        long firstPage = offset / CachePageSize;
+        long lastPage = (offset + count - 1) / CachePageSize;
+        var pages = new byte[lastPage - firstPage + 1][];
+        long generation;
+        lock (_cacheLock)
+        {
+            generation = _cacheGeneration;
+            for (long p = firstPage; p <= lastPage; p++)
+            {
+                if (_cachePages.TryGetValue(p, out var node))
+                {
+                    _cacheLru.Remove(node);
+                    _cacheLru.AddFirst(node);
+                    pages[p - firstPage] = node.Value.Data;
+                    CacheHits++;
+                }
+            }
+        }
+
+        // Fetch each run of missing pages with a single read.
+        for (int i = 0; i < pages.Length; i++)
+        {
+            if (pages[i] != null) continue;
+            int j = i;
+            while (j + 1 < pages.Length && pages[j + 1] == null) j++;
+            long start = (firstPage + i) * CachePageSize;
+            long end = Math.Min((firstPage + j + 1) * CachePageSize, _disk.TotalSize);
+            byte[] data = _disk.ReadBytes(start, checked((int)(end - start)));
+            lock (_cacheLock)
+            {
+                bool fresh = generation == _cacheGeneration;
+                for (int k = i; k <= j; k++)
+                {
+                    int pageLen = (int)Math.Min(CachePageSize, data.Length - (long)(k - i) * CachePageSize);
+                    byte[] page = new byte[CachePageSize];
+                    if (pageLen > 0) Array.Copy(data, (k - i) * CachePageSize, page, 0, pageLen);
+                    pages[k] = page;
+                    CacheMisses++;
+                    if (!fresh || pageLen < CachePageSize) continue; // raced a write, or the disk's last partial page
+                    long pageNo = firstPage + k;
+                    if (_cachePages.ContainsKey(pageNo)) continue;
+                    _cachePages[pageNo] = _cacheLru.AddFirst((pageNo, page));
+                    while (_cachePages.Count > CacheMaxPages)
+                    {
+                        var oldest = _cacheLru.Last!;
+                        _cacheLru.RemoveLast();
+                        _cachePages.Remove(oldest.Value.Page);
+                    }
+                }
+            }
+            i = j;
+        }
+
+        byte[] result = new byte[count];
+        long pos = offset;
+        int written = 0;
+        while (written < count)
+        {
+            long p = pos / CachePageSize;
+            int inPage = (int)(pos % CachePageSize);
+            int take = Math.Min(CachePageSize - inPage, count - written);
+            Array.Copy(pages[p - firstPage], inPage, result, written, take);
+            written += take;
+            pos += take;
+        }
+        return result;
     }
 
     /// <summary>

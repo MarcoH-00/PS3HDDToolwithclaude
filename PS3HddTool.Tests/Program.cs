@@ -99,6 +99,10 @@ internal static class Program
         Check(fs.Superblock.FreeSpaceBytes == 100 * 4096 + 5 * 512, "Free space parse failed.");
         Check(fs.ReadDirectory(fs.ReadInode(2)).Count == 5, "Directory parse failed.");
         Check(fs.ResolvePath("/folder/hello.txt")?.InodeNumber == 6, "Path resolution failed.");
+        var totals = MainViewModel.ComputeFolderTotals(fs, 5)!;
+        Check(totals.Files == 2 && totals.Folders == 0 && totals.Bytes >= 1537, $"Folder totals wrong: {totals}");
+        var rootTotals = MainViewModel.ComputeFolderTotals(fs, 2)!;
+        Check(rootTotals.Folders == 1 && rootTotals.Files == 4, $"Root totals wrong: {rootTotals}");
         var sparse = fs.ReadInode(3);
         Check(sparse.ModifyTime == 1_600_000_000, "Timestamp parse failed.");
         using var output = new VerifySparseStream(sparse.Size, new()
@@ -250,6 +254,13 @@ internal static class Program
             await vm.DecryptAsync();
             Check(!vm.IsPs4 && vm.IsFilesystemMounted && vm.CanWriteFiles && vm.Ps4Partitions.Count == 0,
                 "PS4-to-PS3 switching regression: " + vm.StatusText);
+            var ps3Folder = vm.FileTree.Single(n => n.Name == "folder");
+            await vm.ExpandNodeAsync(ps3Folder);
+            ps3Folder.IsExpanded = true;
+            vm.SelectedNode = ps3Folder.Children.First();
+            await vm.GoToRootAsync();
+            Check(vm.SelectedNode == null && vm.FileTree.Count > 0 && vm.FileTree.All(n => !n.IsExpanded),
+                "Root did not reload and collapse the tree.");
             await vm.OpenImageAsync(Path.Combine(Output, "missing.img"));
             Check(!vm.IsDiskOpen && !vm.IsFilesystemMounted && !vm.IsPs4, "Failed open retained stale state.");
             await vm.OpenImageAsync(path); vm.ImportPs4Key(Fixtures.Key); await vm.DecryptAsync();

@@ -39,7 +39,18 @@ public class FileTreeNode : System.ComponentModel.INotifyPropertyChanged
     public DateTime Modified { get; set; }
     public string Permissions { get; set; } = "";
     public ObservableCollection<FileTreeNode> Children { get; set; } = new();
-    public bool IsExpanded { get; set; }
+    private bool _isExpanded;
+    /// <summary>Bound to the tree item, so a reload can reopen the same folders.</summary>
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set
+        {
+            if (_isExpanded == value) return;
+            _isExpanded = value;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(IsExpanded)));
+        }
+    }
     public bool ChildrenLoaded { get; set; }
 
     public string SizeFormatted
